@@ -44,9 +44,13 @@ chain-ingest extracts raw blockchain data (blocks, transactions, receipts, logs)
 | `config.ts` | Env var parsing with strict validation | `Config` interface |
 | `coordinator.ts` | Chain-scoped Redis work distribution | `Coordinator` class |
 | `worker.ts` | Task execution loop with chain awareness | `Worker` class |
-| `rpc.ts` | JSON-RPC client with retry + circuit breaker | `RpcClient` class |
-| `rate-limiter.ts` | Distributed sliding window rate limiter | `RateLimiter` interface |
+| `rpc.ts` | JSON-RPC client with retry + circuit breaker | `RpcClient` / `RpcEndpoint` |
+| `rpc-pool.ts` | Multi-endpoint round-robin pool with failover | `RpcPool` class |
+| `rate-limiter.ts` | Distributed sliding window rate limiter (shared via Redis Lua) | `RateLimiter` interface |
 | `storage.ts` | PostgreSQL schema, chunked batch inserts, partitioning | `Storage` class |
+| `write-buffer.ts` | Batched write accumulator with flush serialization | `WriteBuffer` class |
+| `metrics.ts` | Prometheus counters, gauges, histograms per worker | `Metrics` class |
+| `metrics-server.ts` | HTTP `/metrics` endpoint for Prometheus scraping | `startMetricsServer()` |
 | `logger.ts` | Structured JSON logging with level filtering | `log()` + `setLogLevel()` |
 | `migrate.ts` | Standalone migration script | — |
 
@@ -54,14 +58,16 @@ chain-ingest extracts raw blockchain data (blocks, transactions, receipts, logs)
 
 ```
 1. Worker claims task from Redis (BRPOPLPUSH — atomic)
-2. For each block in the task range:
-   a. Check if block already completed (Redis ZSCORE)
-   b. Rate-limit check (Lua script — atomic across workers)
-   c. Fetch block + receipts in single HTTP request (JSON-RPC batch)
-   d. Verify parentHash chain continuity
-   e. Batch INSERT into PostgreSQL (one multi-row INSERT per table)
-3. Mark task complete (LREM from processing, ZADD completed blocks)
-4. Update high-water mark in PostgreSQL
+2. Batch-check completed blocks in range (single ZRANGEBYSCORE)
+3. For each uncompleted block in the task range:
+   a. Rate-limit check (Lua script — atomic across workers)
+   b. Fetch block + receipts in single HTTP request (JSON-RPC batch)
+   c. Verify parentHash chain continuity
+   d. Write to buffer or INSERT directly into PostgreSQL
+4. Flush write buffer (if enabled)
+5. Mark task complete (LREM from processing, ZADD completed blocks)
+6. Update high-water mark in PostgreSQL
+7. Evict completed entries below watermark (bounds Redis memory)
 ```
 
 ## Design Decisions & Reasoning
@@ -172,12 +178,16 @@ Same bug class, same fix pattern: never assume a batch fits in memory.
 ## Testing Strategy
 
 Tests use in-memory mocks (no Redis or PostgreSQL required) to verify:
-- **Config validation** — boundary conditions (zero, negative, NaN)
-- **Coordinator logic** — task claiming, completion, requeue, stale reclamation, heartbeats
-- **Rate limiter** — throttle/recovery cycle, floor behavior
-- **RPC client** — retry logic, circuit breaker state machine, batch parsing, null guards
-- **Storage** — SQL construction patterns, idempotency, hex conversion precision
-- **Worker** — task processing flow, drain behavior, error handling
+- **Config validation** — boundary conditions, new highload fields (RPC_URLS, FLUSH_SIZE, METRICS_PORT)
+- **Coordinator logic** — task claiming, completion, requeue, pipelined stale reclamation, heartbeats, watermark eviction
+- **Rate limiter** — shared throttle/recovery via Redis Lua, floor behavior
+- **RPC client** — retry logic, circuit breaker state machine, batch ID matching, null guards
+- **Storage** — SQL construction, idempotency, hex conversion, batch insert via writeBlockData
+- **Write buffer** — flush on threshold, flush on timer, promise-chain serialization, safe teardown
+- **Worker** — task processing, drain with flush, partial progress tracking, crash recovery
+- **Highload** — 1000-task drain, 500-block processing, concurrent worker simulation, intermittent RPC failures
+
+Shared test utilities (`test-utils.ts`) provide a single mock Redis implementation used across all test files.
 
 Integration tests (against real Redis/PG) would live in a separate `tests/integration/` directory, run in CI with Docker Compose.
 

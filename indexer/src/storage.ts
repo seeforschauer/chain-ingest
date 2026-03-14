@@ -22,6 +22,7 @@ export class Storage {
   }
 
   async migrate(): Promise<void> {
+    // Phase 1: transactional schema creation (tables + state)
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -97,44 +98,53 @@ export class Storage {
         )
       `);
 
-      for (let start = 0; start < 10_000_000; start += PARTITION_RANGE) {
-        await this.createPartitionIfNotExists(client, "raw.blocks", start);
-        await this.createPartitionIfNotExists(client, "raw.transactions", start);
-        await this.createPartitionIfNotExists(client, "raw.receipts", start);
-        await this.createPartitionIfNotExists(client, "raw.logs", start);
-      }
-
-      // BRIN for physically ordered data (~100x smaller than B-tree)
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_blocks_timestamp
-        ON raw.blocks USING BRIN (block_timestamp)`);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_tx_block
-        ON raw.transactions USING BRIN (block_number)`);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_rcpt_block
-        ON raw.receipts USING BRIN (block_number)`);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_logs_block
-        ON raw.logs USING BRIN (block_number)`);
-
-      // B-tree for random-access point lookups
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_tx_from
-        ON raw.transactions (from_address)`);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_tx_to
-        ON raw.transactions (to_address)`);
-      await client.query(`CREATE INDEX IF NOT EXISTS idx_logs_address
-        ON raw.logs (address)`);
-
-      // GIN for `topics @> '["0xddf252..."]'` (ERC-20 Transfer filtering)
-      await client.query(`
-        CREATE INDEX IF NOT EXISTS idx_logs_topics
-          ON raw.logs USING GIN (topics);
-      `);
-
       await client.query("COMMIT");
-      log("info", "Schema migration complete");
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
     } finally {
       client.release();
+    }
+
+    // Phase 2: partition + index DDL — runs outside transaction to avoid
+    // holding ACCESS EXCLUSIVE locks on parent tables during the full migration.
+    // All statements are idempotent (IF NOT EXISTS / error code 42P07).
+    const ddlClient = await this.pool.connect();
+    try {
+      for (let start = 0; start < 10_000_000; start += PARTITION_RANGE) {
+        await this.createPartitionIfNotExists(ddlClient, "raw.blocks", start);
+        await this.createPartitionIfNotExists(ddlClient, "raw.transactions", start);
+        await this.createPartitionIfNotExists(ddlClient, "raw.receipts", start);
+        await this.createPartitionIfNotExists(ddlClient, "raw.logs", start);
+      }
+
+      // BRIN for physically ordered data (~100x smaller than B-tree)
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_blocks_timestamp
+        ON raw.blocks USING BRIN (block_timestamp)`);
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_tx_block
+        ON raw.transactions USING BRIN (block_number)`);
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_rcpt_block
+        ON raw.receipts USING BRIN (block_number)`);
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_block
+        ON raw.logs USING BRIN (block_number)`);
+
+      // B-tree for random-access point lookups
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_tx_from
+        ON raw.transactions (from_address)`);
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_tx_to
+        ON raw.transactions (to_address)`);
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_address
+        ON raw.logs (address)`);
+
+      // GIN for `topics @> '["0xddf252..."]'` (ERC-20 Transfer filtering)
+      await ddlClient.query(`
+        CREATE INDEX IF NOT EXISTS idx_logs_topics
+          ON raw.logs USING GIN (topics);
+      `);
+
+      log("info", "Schema migration complete");
+    } finally {
+      ddlClient.release();
     }
   }
 
@@ -196,7 +206,59 @@ export class Storage {
     }
   }
 
+  async insertBlocks(
+    batch: Array<{ block: BlockData; receipts: ReceiptData[]; workerId: string }>
+  ): Promise<void> {
+    if (batch.length === 0) return;
+
+    const partitionStarts = new Set<number>();
+    for (const { block } of batch) {
+      const blockNumber = parseInt(block.number, 16);
+      const rangeStart = Math.floor(blockNumber / PARTITION_RANGE) * PARTITION_RANGE;
+      partitionStarts.add(rangeStart);
+    }
+    for (const rangeStart of partitionStarts) {
+      await this.ensurePartition(rangeStart);
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const { block, receipts, workerId } of batch) {
+        await this.writeBlockData(client, block, receipts, workerId);
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async insertBlock(
+    block: BlockData,
+    receipts: ReceiptData[],
+    workerId: string
+  ): Promise<void> {
+    const blockNumber = parseInt(block.number, 16);
+    await this.ensurePartition(blockNumber);
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.writeBlockData(client, block, receipts, workerId);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async writeBlockData(
+    client: PoolClient,
     block: BlockData,
     receipts: ReceiptData[],
     workerId: string
@@ -204,54 +266,37 @@ export class Storage {
     const blockNumber = parseInt(block.number, 16);
     const timestamp = new Date(parseInt(block.timestamp, 16) * 1000);
 
-    await this.ensurePartition(blockNumber);
+    await client.query(
+      `INSERT INTO raw.blocks
+        (block_number, block_hash, parent_hash, block_timestamp,
+         gas_used, gas_limit, base_fee_per_gas, tx_count, indexed_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (block_number) DO NOTHING`,
+      [
+        blockNumber,
+        block.hash,
+        block.parentHash,
+        timestamp,
+        hexToBigInt(block.gasUsed),
+        hexToBigInt(block.gasLimit),
+        block.baseFeePerGas ? hexToBigInt(block.baseFeePerGas) : null,
+        block.transactions.length,
+        workerId,
+      ]
+    );
 
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
+    const receiptMap = new Map<string, ReceiptData>();
+    for (const r of receipts) {
+      receiptMap.set(r.transactionHash, r);
+    }
 
-      await client.query(
-        {
-          name: "insert_block",
-          text: `INSERT INTO raw.blocks
-            (block_number, block_hash, parent_hash, block_timestamp,
-             gas_used, gas_limit, base_fee_per_gas, tx_count, indexed_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-           ON CONFLICT (block_number) DO NOTHING`,
-          values: [
-            blockNumber,
-            block.hash,
-            block.parentHash,
-            timestamp,
-            hexToBigInt(block.gasUsed),
-            hexToBigInt(block.gasLimit),
-            block.baseFeePerGas ? hexToBigInt(block.baseFeePerGas) : null,
-            block.transactions.length,
-            workerId,
-          ],
-        }
-      );
-
-      const receiptMap = new Map<string, ReceiptData>();
-      for (const r of receipts) {
-        receiptMap.set(r.transactionHash, r);
+    if (block.transactions.length > 0) {
+      for (let i = 0; i < block.transactions.length; i += BATCH_CHUNK_SIZE) {
+        const chunk = block.transactions.slice(i, i + BATCH_CHUNK_SIZE);
+        await this.batchInsertTransactions(client, chunk, blockNumber);
+        await this.batchInsertReceipts(client, chunk, receiptMap, blockNumber);
+        await this.batchInsertLogs(client, chunk, receiptMap, blockNumber);
       }
-
-      if (block.transactions.length > 0) {
-        for (let i = 0; i < block.transactions.length; i += BATCH_CHUNK_SIZE) {
-          const chunk = block.transactions.slice(i, i + BATCH_CHUNK_SIZE);
-          await this.batchInsertTransactions(client, chunk, blockNumber);
-          await this.batchInsertReceipts(client, chunk, receiptMap, blockNumber);
-          await this.batchInsertLogs(client, chunk, receiptMap, blockNumber);
-        }
-      }
-
-      await client.query("COMMIT");
-    } catch (err) {
-      await client.query("ROLLBACK");
-      throw err;
-    } finally {
-      client.release();
     }
   }
 

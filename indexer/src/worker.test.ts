@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Worker } from "./worker.js";
 import type { Coordinator, BlockTask } from "./coordinator.js";
-import type { RpcClient } from "./rpc.js";
+import type { RpcEndpoint } from "./rpc.js";
 import type { Storage } from "./storage.js";
 
 function createMockCoordinator() {
@@ -43,6 +43,7 @@ function createMockCoordinator() {
       processing: 0,
       completed: completedBlocks.size,
     })),
+    evictCompletedBelow: vi.fn(async () => 0),
   } as any;
 }
 
@@ -60,13 +61,14 @@ function createMockRpc() {
       },
       receipts: [],
     })),
-  } as unknown as RpcClient;
+  } as unknown as RpcEndpoint;
 }
 
 function createMockStorage() {
   return {
     insertBlock: vi.fn(async () => {}),
     updateWatermark: vi.fn(async () => {}),
+    getWatermark: vi.fn(async () => 0),
   } as unknown as Storage;
 }
 
@@ -110,7 +112,7 @@ describe("Worker", () => {
       getBlockWithReceipts: vi.fn(async () => {
         throw new Error("RPC down");
       }),
-    } as unknown as RpcClient;
+    } as unknown as RpcEndpoint;
     const storage = createMockStorage();
 
     coord.setTasks([{ startBlock: 0, endBlock: 0 }]);
@@ -144,7 +146,7 @@ describe("Worker", () => {
           receipts: [],
         };
       }),
-    } as unknown as RpcClient;
+    } as unknown as RpcEndpoint;
 
     coord.setTasks([{ startBlock: 0, endBlock: 4 }]);
 
@@ -186,7 +188,7 @@ describe("Worker", () => {
           receipts: [],
         };
       }),
-    } as unknown as RpcClient;
+    } as unknown as RpcEndpoint;
 
     coord.setTasks([{ startBlock: 0, endBlock: 9 }]);
 

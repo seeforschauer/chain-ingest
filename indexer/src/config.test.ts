@@ -16,11 +16,15 @@ describe("loadConfig", () => {
     const config = loadConfig();
     expect(config.redisUrl).toBe("redis://localhost:6379");
     expect(config.rpcUrl).toBe("http://localhost:8545");
+    expect(config.rpcUrls).toEqual(["http://localhost:8545"]);
     expect(config.batchSize).toBe(10);
+    expect(config.flushSize).toBe(1);
+    expect(config.flushIntervalMs).toBe(0);
     expect(config.rateLimit).toBe(50);
     expect(config.maxRetries).toBe(5);
     expect(config.startBlock).toBe(0);
     expect(config.endBlock).toBe("finalized");
+    expect(config.metricsPort).toBeNull();
   });
 
   it("reads env vars when set", () => {
@@ -118,4 +122,82 @@ describe("loadConfig", () => {
     const config = loadConfig();
     expect(config.seedOnly).toBe(true);
   });
+
+  it("parses RPC_URLS as comma-separated list", () => {
+    process.env["RPC_URLS"] = "http://rpc1:8545,http://rpc2:8545,http://rpc3:8545";
+    const config = loadConfig();
+    expect(config.rpcUrls).toEqual([
+      "http://rpc1:8545",
+      "http://rpc2:8545",
+      "http://rpc3:8545",
+    ]);
+  });
+
+  it("falls back to [rpcUrl] when RPC_URLS is unset", () => {
+    process.env["RPC_URL"] = "http://custom:8545";
+    const config = loadConfig();
+    expect(config.rpcUrls).toEqual(["http://custom:8545"]);
+  });
+
+  it("trims whitespace in RPC_URLS entries", () => {
+    process.env["RPC_URLS"] = " http://a:8545 , http://b:8545 ";
+    const config = loadConfig();
+    expect(config.rpcUrls).toEqual(["http://a:8545", "http://b:8545"]);
+  });
+
+  it("falls back to [rpcUrl] when RPC_URLS is empty", () => {
+    process.env["RPC_URLS"] = "";
+    const config = loadConfig();
+    expect(config.rpcUrls).toEqual(["http://localhost:8545"]);
+  });
+
+  it("reads FLUSH_SIZE env var", () => {
+    process.env["FLUSH_SIZE"] = "100";
+    const config = loadConfig();
+    expect(config.flushSize).toBe(100);
+  });
+
+  it("rejects FLUSH_SIZE=0", () => {
+    process.env["FLUSH_SIZE"] = "0";
+    expect(() => loadConfig()).toThrow("positive integer");
+  });
+
+  it("reads FLUSH_INTERVAL_MS env var", () => {
+    process.env["FLUSH_INTERVAL_MS"] = "5000";
+    const config = loadConfig();
+    expect(config.flushIntervalMs).toBe(5000);
+  });
+
+  it("allows FLUSH_INTERVAL_MS=0", () => {
+    process.env["FLUSH_INTERVAL_MS"] = "0";
+    const config = loadConfig();
+    expect(config.flushIntervalMs).toBe(0);
+  });
+
+  it("rejects negative FLUSH_INTERVAL_MS", () => {
+    process.env["FLUSH_INTERVAL_MS"] = "-1";
+    expect(() => loadConfig()).toThrow("non-negative integer");
+  });
+
+  it("reads METRICS_PORT env var", () => {
+    process.env["METRICS_PORT"] = "9090";
+    const config = loadConfig();
+    expect(config.metricsPort).toBe(9090);
+  });
+
+  it("defaults METRICS_PORT to null", () => {
+    const config = loadConfig();
+    expect(config.metricsPort).toBeNull();
+  });
+
+  it("rejects invalid METRICS_PORT", () => {
+    process.env["METRICS_PORT"] = "abc";
+    expect(() => loadConfig()).toThrow("valid port");
+  });
+
+  it("rejects METRICS_PORT out of range", () => {
+    process.env["METRICS_PORT"] = "70000";
+    expect(() => loadConfig()).toThrow("valid port");
+  });
+
 });

@@ -1,8 +1,9 @@
 // Worker: claims tasks, fetches blocks via RPC, persists to PostgreSQL.
 
 import type { Coordinator, BlockTask } from "./coordinator.js";
-import type { RpcClient } from "./rpc.js";
+import type { RpcEndpoint } from "./rpc.js";
 import type { Storage } from "./storage.js";
+import type { WriteBuffer } from "./write-buffer.js";
 import { log } from "./logger.js";
 
 interface WorkerMetrics {
@@ -26,9 +27,10 @@ export class Worker {
   constructor(
     private readonly workerId: string,
     private readonly coordinator: Coordinator,
-    private readonly rpc: RpcClient,
+    private readonly rpc: RpcEndpoint,
     private readonly storage: Storage,
-    private readonly chainId: number = 1
+    private readonly chainId: number = 1,
+    private readonly writeBuffer?: WriteBuffer
   ) {
     this.metrics = {
       blocksIndexed: 0,
@@ -120,7 +122,7 @@ export class Worker {
     });
 
     this.lastBlockHash = null;
-    let lastProcessedBlock = startBlock - 1;
+    let lastFlushedBlock = startBlock - 1;
 
     try {
       const completedBlocks = await this.coordinator.getCompletedBlocksInRange(
@@ -138,6 +140,8 @@ export class Worker {
             remainingTo: endBlock,
           });
 
+          await this.writeBuffer?.flush();
+          lastFlushedBlock = blockNum - 1;
           if (blockNum > startBlock) {
             await this.coordinator.markBlocksCompleted(startBlock, blockNum - 1);
           }
@@ -152,11 +156,21 @@ export class Worker {
         this.currentBlock = blockNum;
         await this.indexBlock(blockNum);
         this.currentBlock = null;
-        lastProcessedBlock = blockNum;
+
+        // Without buffering, each block is durable after insertBlock returns
+        if (!this.writeBuffer) {
+          lastFlushedBlock = blockNum;
+        }
       }
 
+      await this.writeBuffer?.flush();
+      lastFlushedBlock = endBlock;
       await this.coordinator.completeTask(task);
       await this.storage.updateWatermark(this.chainId, endBlock, this.workerId);
+
+      // Evict completed entries below watermark to bound Redis memory growth
+      const watermark = await this.storage.getWatermark(this.chainId);
+      await this.coordinator.evictCompletedBelow(watermark);
 
       // Throttle stats — getStats() is 3 Redis calls per invocation
       const now = Date.now();
@@ -180,10 +194,10 @@ export class Worker {
       this.metrics.errors++;
       this.currentBlock = null;
 
-      // Mark partial progress so the next worker skips already-indexed blocks
-      if (lastProcessedBlock >= startBlock) {
+      // Only mark blocks confirmed durable in PG — never mark buffered-but-unflushed
+      if (lastFlushedBlock >= startBlock) {
         try {
-          await this.coordinator.markBlocksCompleted(startBlock, lastProcessedBlock);
+          await this.coordinator.markBlocksCompleted(startBlock, lastFlushedBlock);
         } catch {
           // Best-effort — if Redis is down, the next worker re-processes (idempotent)
         }
@@ -215,7 +229,11 @@ export class Worker {
     }
     this.lastBlockHash = block.hash;
 
-    await this.storage.insertBlock(block, receipts, this.workerId);
+    if (this.writeBuffer) {
+      await this.writeBuffer.add(block, receipts, this.workerId);
+    } else {
+      await this.storage.insertBlock(block, receipts, this.workerId);
+    }
     this.metrics.blocksIndexed++;
 
     log("debug", "Indexed block", {

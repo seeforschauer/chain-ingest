@@ -45,6 +45,14 @@ export interface LogData {
   blockNumber: string;
 }
 
+export interface RpcEndpoint {
+  getBlockNumber(): Promise<number>;
+  getFinalizedBlockNumber(): Promise<number>;
+  getBlockWithReceipts(
+    blockNumber: number
+  ): Promise<{ block: BlockData; receipts: ReceiptData[] }>;
+}
+
 interface JsonRpcResponse<T> {
   jsonrpc: string;
   id: number;
@@ -65,7 +73,7 @@ enum CircuitState {
   HALF_OPEN,
 }
 
-export class RpcClient {
+export class RpcClient implements RpcEndpoint {
   private id = 0;
   private circuitState = CircuitState.CLOSED;
   private consecutiveFailures = 0;
@@ -219,13 +227,17 @@ export class RpcClient {
     );
     const label = calls.map((c) => c.method).join("+");
 
+    // Track IDs outside lambdas so parseResponse can match by ID, not sort order
+    let batchIds: number[] = [];
+
     return this.withRetry<T>(
       () => {
-        const batch = calls.map((c) => ({
+        batchIds = calls.map(() => ++this.id);
+        const batch = calls.map((c, i) => ({
           jsonrpc: "2.0" as const,
           method: c.method,
           params: c.params,
-          id: ++this.id,
+          id: batchIds[i]!,
         }));
         return fetch(this.url, {
           method: "POST",
@@ -237,19 +249,21 @@ export class RpcClient {
       async (res) => {
         const raw = (await res.json()) as JsonRpcResponse<unknown>[];
 
-        // Filter nulls — some providers return malformed batch responses
-        const responses = raw.filter(
-          (r): r is JsonRpcResponse<unknown> => r != null && typeof r.id === "number"
-        );
-        if (responses.length !== calls.length) {
+        // Match responses by ID map — sort-by-id is fragile if providers normalize IDs
+        const byId = new Map<number, JsonRpcResponse<unknown>>();
+        for (const r of raw) {
+          if (r != null && typeof r.id === "number") byId.set(r.id, r);
+        }
+        if (byId.size !== calls.length) {
           throw new Error(
-            `RPC batch: expected ${calls.length} responses, got ${responses.length} valid entries`
+            `RPC batch: expected ${calls.length} responses, got ${byId.size} valid entries`
           );
         }
 
-        responses.sort((a, b) => a.id - b.id);
         const results: unknown[] = [];
-        for (const resp of responses) {
+        for (const id of batchIds) {
+          const resp = byId.get(id);
+          if (!resp) throw new Error(`RPC batch: missing response for id ${id}`);
           if (resp.error) {
             throw new Error(`RPC batch error ${resp.error.code}: ${resp.error.message}`);
           }

@@ -12,12 +12,17 @@ import { loadConfig } from "./config.js";
 import { Coordinator } from "./coordinator.js";
 import { DistributedRateLimiter } from "./rate-limiter.js";
 import { RpcClient } from "./rpc.js";
+import { RpcPool } from "./rpc-pool.js";
 import { Storage } from "./storage.js";
+import { WriteBuffer } from "./write-buffer.js";
 import { Worker } from "./worker.js";
+import { Metrics } from "./metrics.js";
+import { startMetricsServer } from "./metrics-server.js";
 import { log, setLogLevel } from "./logger.js";
 
 let storage: Storage | undefined;
 let redis: Redis | undefined;
+let metricsServer: ReturnType<typeof startMetricsServer> | undefined;
 
 async function main() {
   const config = loadConfig();
@@ -27,6 +32,7 @@ async function main() {
     chainId: config.chainId,
     workerId: config.workerId,
     rpcUrl: config.rpcUrl,
+    rpcEndpoints: config.rpcUrls.length,
     batchSize: config.batchSize,
     rateLimit: config.rateLimit,
     seedOnly: config.seedOnly,
@@ -40,7 +46,9 @@ async function main() {
 
   const coordinator = new Coordinator(redis, config.chainId);
   const rateLimiter = new DistributedRateLimiter(redis, config.rateLimit, config.chainId);
-  const rpc = new RpcClient(config.rpcUrl, rateLimiter, config.maxRetries);
+  const rpc = config.rpcUrls.length > 1
+    ? new RpcPool(config.rpcUrls, rateLimiter, config.maxRetries)
+    : new RpcClient(config.rpcUrl, rateLimiter, config.maxRetries);
 
   let endBlock: number;
   if (config.endBlock === "finalized") {
@@ -79,7 +87,16 @@ async function main() {
     return;
   }
 
-  const worker = new Worker(config.workerId, coordinator, rpc, storage, config.chainId);
+  if (config.metricsPort) {
+    const metrics = new Metrics(config.chainId, config.workerId);
+    metricsServer = startMetricsServer(config.metricsPort, metrics.registry);
+  }
+
+  const writeBuffer = config.flushSize > 1
+    ? new WriteBuffer(storage, config.flushSize, config.flushIntervalMs)
+    : undefined;
+
+  const worker = new Worker(config.workerId, coordinator, rpc, storage, config.chainId, writeBuffer);
 
   const shutdown = () => {
     log("info", "Shutting down — draining current block...");
@@ -91,7 +108,13 @@ async function main() {
 
   await worker.start();
 
-  // quit() sends QUIT for graceful disconnect; disconnect() drops TCP
+  await writeBuffer?.flush();
+  writeBuffer?.dispose();
+  await new Promise<void>((resolve) => {
+    if (!metricsServer) return resolve();
+    metricsServer.closeAllConnections?.();
+    metricsServer.close(() => resolve());
+  });
   await storage.close();
   await redis.quit();
 }

@@ -12,7 +12,14 @@
     "test:watch": "vitest",
     "lint": "tsc --noEmit"
   },
-  "keywords": ["blockchain", "evm", "indexer", "ingestion", "redis", "postgresql"],
+  "keywords": [
+    "blockchain",
+    "evm",
+    "indexer",
+    "ingestion",
+    "redis",
+    "postgresql"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
@@ -25,6 +32,7 @@
   },
   "dependencies": {
     "ioredis": "^5.10.0",
-    "pg": "^8.20.0"
+    "pg": "^8.20.0",
+    "prom-client": "^15.1.3"
   }
 }

@@ -197,47 +197,86 @@ export class Coordinator {
    */
   async reclaimStaleTasks(staleMs: number = 120_000): Promise<number> {
     const processing = await this.redis.lrange(this.QUEUE_PROCESSING, 0, -1);
-    const now = Date.now();
-    let reclaimed = 0;
+    if (processing.length === 0) return 0;
 
+    const now = Date.now();
+
+    // Batch-fetch all metadata in one pipeline
+    const entries: Array<{ raw: string; task: BlockTask; taskKey: string }> = [];
+    const metaPipe = this.redis.pipeline();
     for (const raw of processing) {
       const task: BlockTask = JSON.parse(raw);
       const taskKey = `${task.startBlock}:${task.endBlock}`;
+      entries.push({ raw, task, taskKey });
+      metaPipe.hget(this.TASK_META, taskKey);
+    }
+    const metaResults = await metaPipe.exec();
 
-      const metaRaw = await this.redis.hget(this.TASK_META, taskKey);
+    // Collect unique worker IDs that need heartbeat checks
+    const workerIds = new Set<string>();
+    const staleEntries: Array<{
+      raw: string; task: BlockTask; taskKey: string;
+      assignedTo: string | null; assignedAt?: number;
+    }> = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i]!;
+      const metaRaw = metaResults?.[i]?.[1] as string | null;
+
       if (!metaRaw) {
-        // Orphaned — worker crashed between BRPOPLPUSH and HSET
-        log("warn", "Reclaiming orphaned task (no metadata)", {
-          startBlock: task.startBlock,
-          endBlock: task.endBlock,
-        });
-        await this.redis.rpush(this.QUEUE_PENDING, raw);
-        await this.redis.lrem(this.QUEUE_PROCESSING, 1, raw);
-        reclaimed++;
+        staleEntries.push({ ...entry, assignedTo: null });
         continue;
       }
 
       const meta: { assignedTo: string; assignedAt: number } = JSON.parse(metaRaw);
       if (now - meta.assignedAt <= staleMs) continue;
 
-      const alive = await this.isWorkerAlive(meta.assignedTo);
-      if (alive) {
+      staleEntries.push({ ...entry, assignedTo: meta.assignedTo, assignedAt: meta.assignedAt });
+      workerIds.add(meta.assignedTo);
+    }
+
+    if (staleEntries.length === 0) return 0;
+
+    // Batch-fetch heartbeats for all unique workers
+    const aliveWorkers = new Set<string>();
+    if (workerIds.size > 0) {
+      const heartbeatPipe = this.redis.pipeline();
+      const workerList = [...workerIds];
+      for (const wid of workerList) {
+        heartbeatPipe.get(`${this.HEARTBEAT_PREFIX}${wid}`);
+      }
+      const heartbeatResults = await heartbeatPipe.exec();
+      for (let i = 0; i < workerList.length; i++) {
+        if (heartbeatResults?.[i]?.[1] !== null) {
+          aliveWorkers.add(workerList[i]!);
+        }
+      }
+    }
+
+    let reclaimed = 0;
+    for (const { raw, task, taskKey, assignedTo, assignedAt } of staleEntries) {
+      if (!assignedTo) {
+        log("warn", "Reclaiming orphaned task (no metadata)", {
+          startBlock: task.startBlock,
+          endBlock: task.endBlock,
+        });
+      } else if (aliveWorkers.has(assignedTo)) {
         log("debug", "Task old but worker alive — skipping reclaim", {
           startBlock: task.startBlock,
-          assignedTo: meta.assignedTo,
+          assignedTo,
         });
         continue;
+      } else {
+        log("warn", "Reclaiming stale task", {
+          startBlock: task.startBlock,
+          endBlock: task.endBlock,
+          assignedTo,
+          staleSec: Math.round((now - (assignedAt ?? now)) / 1000),
+        });
       }
 
-      log("warn", "Reclaiming stale task", {
-        startBlock: task.startBlock,
-        endBlock: task.endBlock,
-        assignedTo: meta.assignedTo,
-        staleSec: Math.round((now - meta.assignedAt) / 1000),
-      });
       // Write before delete
       await this.redis.rpush(this.QUEUE_PENDING, raw);
-
       const cleanup = this.redis.pipeline();
       cleanup.lrem(this.QUEUE_PROCESSING, 1, raw);
       cleanup.hdel(this.TASK_META, taskKey);
@@ -246,6 +285,23 @@ export class Coordinator {
     }
 
     return reclaimed;
+  }
+
+  /** Evict completed entries below watermark — prevents unbounded sorted-set growth. */
+  async evictCompletedBelow(watermark: number): Promise<number> {
+    if (watermark <= 0) return 0;
+    const removed = await this.redis.zremrangebyscore(
+      this.COMPLETED_SET,
+      0,
+      watermark - 1
+    );
+    if (removed > 0) {
+      log("debug", "Evicted completed blocks below watermark", {
+        watermark,
+        removed,
+      });
+    }
+    return removed;
   }
 
   async getStats(): Promise<{

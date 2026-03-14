@@ -71,10 +71,10 @@ Five tables in a `raw` schema:
 | Table | Primary Key | Notable |
 |-------|-----------|---------|
 | `raw.blocks` | `block_number` | Partitioned by range, stores `indexed_by` worker ID for debugging |
-| `raw.transactions` | `tx_hash` | No FK (partitioned tables), indexed on `from`/`to` |
-| `raw.receipts` | `tx_hash` | Stores log count |
+| `raw.transactions` | `(block_number, tx_hash)` | Partitioned, indexed on `from`/`to` |
+| `raw.receipts` | `(block_number, tx_hash)` | Partitioned, stores log count |
 | `raw.logs` | `(block_number, id)` | Partitioned, JSONB topics with GIN index, UNIQUE on `(block_number, tx_hash, log_index)` |
-| `raw.indexer_state` | `chain_id` | High-water mark for per-chain progress tracking, survives Redis flushes |
+| `raw.indexer_state` | `chain_id` | High-water mark per chain, survives Redis flushes |
 
 **Why NUMERIC for gas/value:** JavaScript loses precision above 2^53. Storing as NUMERIC (via BigInt.toString()) preserves full EVM precision.
 
@@ -130,7 +130,7 @@ LOG_LEVEL=debug npm start
 
 ## What I'd Add for Production
 
-Reorg handling: index at `latest` with a reorg buffer — store the last N block hashes and detect `parentHash` breaks (the inline `parentHash` check in `indexBlock` already does this), then re-index affected blocks. The current `finalized` approach is safe but runs 12-15 minutes behind chain tip on Ethereum. Monitoring via Prometheus metrics (blocks/sec, RPC latency histograms, circuit breaker state) feeding Grafana dashboards with PagerDuty alerting on ingestion lag. CI/CD with GitHub Actions for lint/test/build and Docker multi-stage builds for minimal production images.
+Reorg handling: index at `latest` with a reorg buffer — store the last N block hashes and detect `parentHash` breaks (the inline `parentHash` check in `indexBlock` already does this), then re-index affected blocks. The current `finalized` approach is safe but runs 12-15 minutes behind chain tip on Ethereum. Prometheus metrics are wired (`METRICS_PORT`) with counters/gauges/histograms — next step is instrumenting the hot paths (RPC duration, blocks/sec) and feeding Grafana dashboards with PagerDuty alerting on ingestion lag. CI/CD with GitHub Actions for lint/test/build and Docker multi-stage builds for minimal production images.
 
 ## Scale Considerations
 

@@ -99,7 +99,7 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 - [ ] **Mock at the interface boundary**: Mock Redis/PG, not internal methods. Tests verify behavior, not implementation.
 - [ ] **Test the failure paths**: Requeue on error, stale task reclaim, circuit breaker state transitions, drain mid-task
 
-## 15. Systematic Bug-Class Auditing
+## 16. Systematic Bug-Class Auditing
 
 - [ ] **After fixing any bug, grep for the same pattern across the entire codebase**: The write-before-delete bug appeared in 4 callsites. Fixing it in one place while missing three others is worse than not fixing it at all — it shows you understood the problem but didn't apply it systematically.
   - Method: `grep lrem` (or whatever the operation is) → audit every callsite
@@ -109,4 +109,4 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 
 ---
 
-*Extracted from 9 self-review rounds. Each item caught a real bug or prevented a production incident.*
+*Extracted from multiple self-review rounds. Each item caught a real bug or prevented a production incident.*

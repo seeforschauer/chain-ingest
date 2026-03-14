@@ -75,6 +75,10 @@ All configuration via environment variables — no config files to manage across
 | `WORKER_ID` | auto-generated | Unique worker identifier |
 | `SEED_ONLY` | `false` | Seed queue and exit |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `RPC_URLS` | (falls back to `RPC_URL`) | Comma-separated list of RPC endpoints for round-robin pool |
+| `FLUSH_SIZE` | `1` | Write buffer: flush after N blocks (1 = no buffering) |
+| `FLUSH_INTERVAL_MS` | `0` | Write buffer: periodic flush interval (0 = disabled) |
+| `METRICS_PORT` | (disabled) | Prometheus `/metrics` HTTP port |
 
 All numeric values are strictly validated (`Number()` + `Number.isInteger()`). No silent truncation from `parseInt`.
 
@@ -95,12 +99,12 @@ All inserts are idempotent (`ON CONFLICT DO NOTHING`). Batch inserts are chunked
 ## Testing
 
 ```bash
-npm test              # 67 tests, ~3s
+npm test              # 88 tests, ~3s
 npm run test:watch    # Watch mode
 npm run typecheck     # TypeScript strict check
 ```
 
-7 test files covering config validation (18), coordinator logic (13), rate limiter (5), RPC client (8), storage (6), worker behavior (8), and highload scenarios (9).
+8 test files covering config validation (30), coordinator logic (14), rate limiter (5), RPC client (8), storage (9), worker behavior (6), write buffer (7), and highload scenarios (9).
 
 All tests use in-memory mocks — no Redis or PostgreSQL required.
 
@@ -126,8 +130,12 @@ All tests use in-memory mocks — no Redis or PostgreSQL required.
 | `coordinator.ts` | Chain-scoped Redis work distribution |
 | `worker.ts` | Task execution loop, drain, partial progress |
 | `rpc.ts` | JSON-RPC batching, retry, circuit breaker |
+| `rpc-pool.ts` | Round-robin multi-endpoint pool with per-endpoint circuit breaker failover |
 | `rate-limiter.ts` | Distributed sliding window (Lua) with adaptive backpressure |
 | `storage.ts` | PostgreSQL schema, partitioned tables, chunked batch inserts |
+| `write-buffer.ts` | Accumulates blocks and flushes to storage in configurable batches |
+| `metrics.ts` | Prometheus registry with counters, gauges, and histograms per worker |
+| `metrics-server.ts` | HTTP server exposing `/metrics` for Prometheus scraping |
 | `logger.ts` | Structured JSON logging, level filtering, stdout/stderr split |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design decisions and rationale.
