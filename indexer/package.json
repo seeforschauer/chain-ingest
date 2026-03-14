@@ -1,0 +1,30 @@
+{
+  "name": "chain-ingest",
+  "version": "1.0.0",
+  "description": "Distributed EVM blockchain ingestion service — Redis-coordinated workers extract blocks, transactions, receipts, and logs into partitioned PostgreSQL",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "dev": "tsx watch src/main.ts",
+    "migrate": "tsx src/migrate.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": ["blockchain", "evm", "indexer", "ingestion", "redis", "postgresql"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/pg": "^8.18.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "ioredis": "^5.10.0",
+    "pg": "^8.20.0"
+  }
+}
