@@ -41,8 +41,7 @@ async function main() {
   redis = new Redis(config.redisUrl);
   redis.on("error", (err) => log("error", "Redis error", { error: err.message }));
 
-  storage = new Storage(config.postgresUrl);
-  await storage.migrate();
+  storage = new Storage(config.postgresUrl, config.pgPoolMax);
 
   const coordinator = new Coordinator(redis, config.chainId);
   const rateLimiter = new DistributedRateLimiter(redis, config.rateLimit, config.chainId);
@@ -62,6 +61,8 @@ async function main() {
   } else {
     endBlock = config.endBlock;
   }
+
+  await storage.migrate(endBlock);
 
   const startBlock = config.startBlock;
 
@@ -87,8 +88,9 @@ async function main() {
     return;
   }
 
+  let metrics: Metrics | undefined;
   if (config.metricsPort) {
-    const metrics = new Metrics(config.chainId, config.workerId);
+    metrics = new Metrics(config.chainId, config.workerId);
     metricsServer = startMetricsServer(config.metricsPort, metrics.registry);
   }
 
@@ -96,11 +98,15 @@ async function main() {
     ? new WriteBuffer(storage, config.flushSize, config.flushIntervalMs)
     : undefined;
 
-  const worker = new Worker(config.workerId, coordinator, rpc, storage, config.chainId, writeBuffer);
+  const worker = new Worker(config.workerId, coordinator, rpc, storage, config.chainId, writeBuffer, metrics);
 
   const shutdown = () => {
     log("info", "Shutting down — draining current block...");
     worker.stop();
+    setTimeout(() => {
+      log("error", "Shutdown deadline exceeded — forcing exit");
+      process.exit(1);
+    }, 25_000).unref();
   };
 
   process.on("SIGINT", shutdown);

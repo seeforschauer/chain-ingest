@@ -415,19 +415,18 @@ describe("High-load: Storage batch insert", () => {
     expect(txInsert).toBeDefined();
     expect(txInsert!.values!.length).toBe(2000); // 200 tx * 10 columns
 
-    // Verify receipt INSERT has 200 * 6 = 1200 parameters
+    // Verify receipt INSERT has 200 * 7 = 1400 parameters
     const rcptInsert = queries.find(
       (q) => q.text?.includes("raw.receipts") && q.text?.includes("INSERT")
     );
     expect(rcptInsert).toBeDefined();
     expect(rcptInsert!.values!.length).toBe(1400); // 200 receipts * 7 columns (including block_number)
 
-    // Verify log INSERT has 200 * 6 = 1200 parameters (1 log per receipt)
     const logInsert = queries.find(
       (q) => q.text?.includes("raw.logs") && q.text?.includes("INSERT")
     );
     expect(logInsert).toBeDefined();
-    expect(logInsert!.values!.length).toBe(1200); // 200 logs * 6 columns
+    expect(logInsert!.values!.length).toBe(1400); // 200 logs * 7 columns
   });
 
   it("handles block with zero transactions (empty block)", async () => {

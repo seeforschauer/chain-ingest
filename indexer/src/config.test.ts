@@ -24,7 +24,14 @@ describe("loadConfig", () => {
     expect(config.maxRetries).toBe(5);
     expect(config.startBlock).toBe(0);
     expect(config.endBlock).toBe("finalized");
+    expect(config.pgPoolMax).toBe(20);
     expect(config.metricsPort).toBeNull();
+  });
+
+  it("reads PG_POOL_MAX env var", () => {
+    process.env["PG_POOL_MAX"] = "50";
+    const config = loadConfig();
+    expect(config.pgPoolMax).toBe(50);
   });
 
   it("reads env vars when set", () => {

@@ -4,6 +4,7 @@ import type { Coordinator, BlockTask } from "./coordinator.js";
 import type { RpcEndpoint } from "./rpc.js";
 import type { Storage } from "./storage.js";
 import type { WriteBuffer } from "./write-buffer.js";
+import type { Metrics } from "./metrics.js";
 import { log } from "./logger.js";
 
 interface WorkerMetrics {
@@ -30,7 +31,8 @@ export class Worker {
     private readonly rpc: RpcEndpoint,
     private readonly storage: Storage,
     private readonly chainId: number = 1,
-    private readonly writeBuffer?: WriteBuffer
+    private readonly writeBuffer?: WriteBuffer,
+    private readonly promMetrics?: Metrics
   ) {
     this.metrics = {
       blocksIndexed: 0,
@@ -216,25 +218,35 @@ export class Worker {
   }
 
   private async indexBlock(blockNumber: number): Promise<void> {
+    const blockStart = Date.now();
+    this.promMetrics?.currentBlock.set(blockNumber);
+
+    const rpcStart = Date.now();
     const { block, receipts } = await this.rpc.getBlockWithReceipts(blockNumber);
+    this.promMetrics?.rpcDurationSeconds.observe((Date.now() - rpcStart) / 1000);
+    this.promMetrics?.rpcCallsTotal.inc({ method: "getBlockWithReceipts" });
     this.metrics.rpcCalls += 2;
 
-    // Verify parentHash chain continuity within a task
     if (this.lastBlockHash && block.parentHash !== this.lastBlockHash) {
-      log("error", "Block chain integrity violation — possible reorg", {
-        block: blockNumber,
-        expectedParentHash: this.lastBlockHash,
-        actualParentHash: block.parentHash,
-      });
+      throw new Error(
+        `Chain integrity violation at block ${blockNumber}: ` +
+        `expected parentHash ${this.lastBlockHash}, got ${block.parentHash}`
+      );
     }
     this.lastBlockHash = block.hash;
 
+    const storageStart = Date.now();
     if (this.writeBuffer) {
       await this.writeBuffer.add(block, receipts, this.workerId);
     } else {
       await this.storage.insertBlock(block, receipts, this.workerId);
     }
+    this.promMetrics?.storageFlushDurationSeconds.observe((Date.now() - storageStart) / 1000);
+    this.promMetrics?.blocksIndexedTotal.inc();
+    this.promMetrics?.transactionsIndexedTotal.inc(block.transactions.length);
     this.metrics.blocksIndexed++;
+
+    this.promMetrics?.blockProcessingDurationSeconds.observe((Date.now() - blockStart) / 1000);
 
     log("debug", "Indexed block", {
       block: blockNumber,

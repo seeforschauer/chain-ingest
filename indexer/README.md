@@ -78,7 +78,8 @@ All configuration via environment variables — no config files to manage across
 | `RPC_URLS` | (falls back to `RPC_URL`) | Comma-separated list of RPC endpoints for round-robin pool |
 | `FLUSH_SIZE` | `1` | Write buffer: flush after N blocks (1 = no buffering) |
 | `FLUSH_INTERVAL_MS` | `0` | Write buffer: periodic flush interval (0 = disabled) |
-| `METRICS_PORT` | (disabled) | Prometheus `/metrics` HTTP port |
+| `PG_POOL_MAX` | `20` | PostgreSQL connection pool size |
+| `METRICS_PORT` | (disabled) | Prometheus `/metrics` + `/healthz` HTTP port |
 
 All numeric values are strictly validated (`Number()` + `Number.isInteger()`). No silent truncation from `parseInt`.
 
@@ -91,7 +92,7 @@ Five tables in the `raw` schema, all data tables range-partitioned by `block_num
 | `raw.blocks` | `block_number` | BRIN(timestamp) | Stores `indexed_by` for debugging |
 | `raw.transactions` | `block_number` | BRIN(block_number), B-tree(from, to) | PK: `(block_number, tx_hash)` |
 | `raw.receipts` | `block_number` | BRIN(block_number) | `block_number` denormalized for co-partitioning |
-| `raw.logs` | `block_number` | BRIN(block_number), B-tree(address), GIN(topics) | Highest volume table |
+| `raw.logs` | `block_number` | BRIN(block_number), B-tree(address, topic0) | Highest volume table |
 | `raw.indexer_state` | — | — | Per-chain high-water mark (survives Redis flushes) |
 
 All inserts are idempotent (`ON CONFLICT DO NOTHING`). Batch inserts are chunked at 5,000 rows to stay under PostgreSQL's 65,535 parameter limit. Logs are chunked independently from transactions (1:N fanout — DeFi transactions emit 5-50 logs each).
@@ -99,12 +100,12 @@ All inserts are idempotent (`ON CONFLICT DO NOTHING`). Batch inserts are chunked
 ## Testing
 
 ```bash
-npm test              # 88 tests, ~3s
+npm test              # 89 tests, ~3s
 npm run test:watch    # Watch mode
 npm run typecheck     # TypeScript strict check
 ```
 
-8 test files covering config validation (30), coordinator logic (14), rate limiter (5), RPC client (8), storage (9), worker behavior (6), write buffer (7), and highload scenarios (9).
+8 test files covering config validation (31), coordinator logic (14), rate limiter (5), RPC client (8), storage (9), worker behavior (6), write buffer (7), and highload scenarios (9).
 
 All tests use in-memory mocks — no Redis or PostgreSQL required.
 
@@ -120,6 +121,11 @@ All tests use in-memory mocks — no Redis or PostgreSQL required.
 | **Partial progress** | On error, marks completed blocks before requeue — avoids redundant RPC on retry |
 | **Graceful drain** | SIGTERM → finish current block → mark progress → requeue remainder → clean exit |
 | **Idempotent storage** | `ON CONFLICT DO NOTHING` on all tables; safe to re-process any block |
+| **RPC pool failover** | Round-robin across endpoints; per-endpoint circuit breaker; automatic failover on failure |
+| **Write buffer** | Configurable batch flush with promise-chain serialization; flush-before-complete ordering |
+| **Shared rate adaptation** | Throttle/recovery state stored in Redis via Lua — all workers reduce together on 429 |
+| **Bounded Redis memory** | Completed-set entries evicted below PG watermark after each task |
+| **Health check** | `GET /healthz` on metrics port for k8s liveness probes |
 
 ## Module map
 
@@ -137,6 +143,7 @@ All tests use in-memory mocks — no Redis or PostgreSQL required.
 | `metrics.ts` | Prometheus registry with counters, gauges, and histograms per worker |
 | `metrics-server.ts` | HTTP server exposing `/metrics` for Prometheus scraping |
 | `logger.ts` | Structured JSON logging, level filtering, stdout/stderr split |
+| `migrate.ts` | Standalone migration script (`npm run migrate`) |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design decisions and rationale.
 See [APPROACH.md](APPROACH.md) for failure scenarios and scale considerations.

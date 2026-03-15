@@ -76,20 +76,23 @@ enum CircuitState {
 export class RpcClient implements RpcEndpoint {
   private id = 0;
   private circuitState = CircuitState.CLOSED;
-  private consecutiveFailures = 0;
   private circuitOpenedAt = 0;
-  private readonly failureThreshold: number;
+  private readonly failureRateThreshold: number;
+  private readonly windowSize: number;
+  private readonly outcomeWindow: boolean[] = [];
   private readonly cooldownMs: number;
 
   constructor(
     private readonly url: string,
     private readonly rateLimiter: RateLimiter,
     private readonly maxRetries: number,
-    failureThreshold = 5,
-    cooldownMs = 30_000
+    failureRateThreshold = 0.6,
+    cooldownMs = 30_000,
+    windowSize = 20
   ) {
-    this.failureThreshold = failureThreshold;
+    this.failureRateThreshold = failureRateThreshold;
     this.cooldownMs = cooldownMs;
+    this.windowSize = windowSize;
   }
 
   private checkCircuit(): void {
@@ -110,30 +113,44 @@ export class RpcClient implements RpcEndpoint {
     }
   }
 
+  private recordOutcome(success: boolean): void {
+    this.outcomeWindow.push(success);
+    if (this.outcomeWindow.length > this.windowSize) {
+      this.outcomeWindow.shift();
+    }
+  }
+
   private onSuccess(): void {
+    this.recordOutcome(true);
     if (this.circuitState === CircuitState.HALF_OPEN) {
       log("info", "Circuit breaker closed — probe succeeded", {
         url: this.url,
       });
     }
-    this.consecutiveFailures = 0;
     this.circuitState = CircuitState.CLOSED;
   }
 
   private onFailure(): void {
-    this.consecutiveFailures++;
+    this.recordOutcome(false);
 
-    if (
-      this.circuitState === CircuitState.HALF_OPEN ||
-      this.consecutiveFailures >= this.failureThreshold
-    ) {
+    if (this.circuitState === CircuitState.HALF_OPEN) {
       this.circuitState = CircuitState.OPEN;
       this.circuitOpenedAt = Date.now();
-      log("warn", "Circuit breaker OPEN", {
-        url: this.url,
-        consecutiveFailures: this.consecutiveFailures,
-        cooldownMs: this.cooldownMs,
-      });
+      log("warn", "Circuit breaker OPEN — probe failed", { url: this.url });
+      return;
+    }
+
+    if (this.outcomeWindow.length >= this.windowSize) {
+      const failures = this.outcomeWindow.filter((v) => !v).length;
+      if (failures / this.windowSize >= this.failureRateThreshold) {
+        this.circuitState = CircuitState.OPEN;
+        this.circuitOpenedAt = Date.now();
+        log("warn", "Circuit breaker OPEN", {
+          url: this.url,
+          failureRate: (failures / this.windowSize * 100).toFixed(0) + "%",
+          cooldownMs: this.cooldownMs,
+        });
+      }
     }
   }
 

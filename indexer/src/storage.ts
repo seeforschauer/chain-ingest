@@ -11,17 +11,17 @@ export class Storage {
   private pool: Pool;
   private readonly knownPartitions = new Set<string>();
 
-  constructor(connectionString: string) {
+  constructor(connectionString: string, poolMax: number = 20) {
     this.pool = new Pool({
       connectionString,
-      max: 20,
+      max: poolMax,
       idleTimeoutMillis: 30_000,
       statement_timeout: 30_000,
       idle_in_transaction_session_timeout: 60_000,
     });
   }
 
-  async migrate(): Promise<void> {
+  async migrate(endBlock: number = 10_000_000): Promise<void> {
     // Phase 1: transactional schema creation (tables + state)
     const client = await this.pool.connect();
     try {
@@ -34,9 +34,9 @@ export class Storage {
           block_hash      TEXT NOT NULL,
           parent_hash     TEXT NOT NULL,
           block_timestamp TIMESTAMPTZ NOT NULL,
-          gas_used        NUMERIC NOT NULL,
-          gas_limit       NUMERIC NOT NULL,
-          base_fee_per_gas NUMERIC,
+          gas_used        BIGINT NOT NULL,
+          gas_limit       BIGINT NOT NULL,
+          base_fee_per_gas BIGINT,
           tx_count        INT NOT NULL DEFAULT 0,
           indexed_by      TEXT,
           indexed_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -52,8 +52,8 @@ export class Storage {
           from_address    TEXT NOT NULL,
           to_address      TEXT,
           value           NUMERIC NOT NULL,
-          gas_price       NUMERIC,
-          gas_limit       NUMERIC NOT NULL,
+          gas_price       BIGINT,
+          gas_limit       BIGINT NOT NULL,
           input_data      TEXT,
           nonce           BIGINT NOT NULL,
           PRIMARY KEY (block_number, tx_hash)
@@ -65,8 +65,8 @@ export class Storage {
           tx_hash             TEXT NOT NULL,
           block_number        BIGINT NOT NULL,
           status              SMALLINT,
-          gas_used            NUMERIC NOT NULL,
-          cumulative_gas_used NUMERIC NOT NULL,
+          gas_used            BIGINT NOT NULL,
+          cumulative_gas_used BIGINT NOT NULL,
           contract_address    TEXT,
           log_count           INT NOT NULL DEFAULT 0,
           PRIMARY KEY (block_number, tx_hash)
@@ -81,6 +81,7 @@ export class Storage {
           tx_hash          TEXT NOT NULL,
           log_index        INT NOT NULL,
           address          TEXT NOT NULL,
+          topic0           TEXT,
           topics           JSONB NOT NULL,
           data             TEXT NOT NULL,
           block_number     BIGINT NOT NULL,
@@ -111,7 +112,8 @@ export class Storage {
     // All statements are idempotent (IF NOT EXISTS / error code 42P07).
     const ddlClient = await this.pool.connect();
     try {
-      for (let start = 0; start < 10_000_000; start += PARTITION_RANGE) {
+      const partitionCeiling = Math.ceil((endBlock + 1) / PARTITION_RANGE) * PARTITION_RANGE;
+      for (let start = 0; start < partitionCeiling; start += PARTITION_RANGE) {
         await this.createPartitionIfNotExists(ddlClient, "raw.blocks", start);
         await this.createPartitionIfNotExists(ddlClient, "raw.transactions", start);
         await this.createPartitionIfNotExists(ddlClient, "raw.receipts", start);
@@ -128,7 +130,7 @@ export class Storage {
       await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_block
         ON raw.logs USING BRIN (block_number)`);
 
-      // B-tree for random-access point lookups
+      // B-tree for address lookups — BRIN doesn't help here (no physical correlation)
       await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_tx_from
         ON raw.transactions (from_address)`);
       await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_tx_to
@@ -136,11 +138,11 @@ export class Storage {
       await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_address
         ON raw.logs (address)`);
 
-      // GIN for `topics @> '["0xddf252..."]'` (ERC-20 Transfer filtering)
-      await ddlClient.query(`
-        CREATE INDEX IF NOT EXISTS idx_logs_topics
-          ON raw.logs USING GIN (topics);
-      `);
+      // B-tree on topic0 (event signature) — covers 90% of log queries.
+      // GIN on full JSONB dropped: highest write amplification in PG.
+      // If multi-topic containment is needed, add GIN with jsonb_path_ops.
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_topic0
+        ON raw.logs (topic0)`);
 
       log("info", "Schema migration complete");
     } finally {
@@ -397,14 +399,15 @@ export class Storage {
       if (!receipt) continue;
 
       for (const logEntry of receipt.logs) {
-        const offset = paramIdx * 6;
+        const offset = paramIdx * 7;
         placeholders.push(
-          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6})`
+          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`
         );
         values.push(
           logEntry.transactionHash,
           parseInt(logEntry.logIndex, 16),
           logEntry.address,
+          logEntry.topics[0] ?? null,
           JSON.stringify(logEntry.topics),
           logEntry.data,
           blockNumber
@@ -414,7 +417,7 @@ export class Storage {
         if (paramIdx >= BATCH_CHUNK_SIZE) {
           await client.query(
             `INSERT INTO raw.logs
-              (tx_hash, log_index, address, topics, data, block_number)
+              (tx_hash, log_index, address, topic0, topics, data, block_number)
              VALUES ${placeholders.join(", ")}
              ON CONFLICT (block_number, tx_hash, log_index) DO NOTHING`,
             values
@@ -430,7 +433,7 @@ export class Storage {
 
     await client.query(
       `INSERT INTO raw.logs
-        (tx_hash, log_index, address, topics, data, block_number)
+        (tx_hash, log_index, address, topic0, topics, data, block_number)
        VALUES ${placeholders.join(", ")}
        ON CONFLICT (block_number, tx_hash, log_index) DO NOTHING`,
       values

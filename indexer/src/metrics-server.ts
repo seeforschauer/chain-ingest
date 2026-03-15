@@ -20,6 +20,11 @@ export function startMetricsServer(
       }
       return;
     }
+    if (req.method === "GET" && req.url === "/healthz") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("ok");
+      return;
+    }
     res.writeHead(404);
     res.end();
   });

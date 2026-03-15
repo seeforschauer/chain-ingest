@@ -123,10 +123,9 @@ describe("RpcClient", () => {
     expect(limiter.recordThrottle).toHaveBeenCalledOnce();
   });
 
-  it("circuit breaker opens after consecutive failures", async () => {
+  it("circuit breaker opens after windowed failure rate exceeded", async () => {
     vi.useFakeTimers();
 
-    // All calls fail
     mockFetch([
       { status: 500, body: {} },
       { status: 500, body: {} },
@@ -134,15 +133,15 @@ describe("RpcClient", () => {
       { status: 500, body: {} },
     ]);
 
-    // threshold=3, maxRetries=0 so each getBlockNumber makes exactly 1 attempt.
-    // After 3 failed calls the circuit opens.
-    const rpc = new RpcClient("http://test", stubLimiter, 0, 3, 60_000);
+    // failureRateThreshold=0.6, windowSize=3, maxRetries=0
+    // After 3 failures in a window of 3: 100% failure rate → opens
+    const rpc = new RpcClient("http://test", stubLimiter, 0, 0.6, 60_000, 3);
 
-    await expect(rpc.getBlockNumber()).rejects.toThrow(); // failure 1
-    await expect(rpc.getBlockNumber()).rejects.toThrow(); // failure 2
-    await expect(rpc.getBlockNumber()).rejects.toThrow(); // failure 3 → opens
+    await expect(rpc.getBlockNumber()).rejects.toThrow(); // 1/1 = 100% but window not full
+    await expect(rpc.getBlockNumber()).rejects.toThrow(); // 2/2 = 100% but window not full
+    await expect(rpc.getBlockNumber()).rejects.toThrow(); // 3/3 = 100% ≥ 60% → opens
 
-    // Next call should be rejected by circuit breaker without hitting fetch
+    // Next call rejected by circuit breaker
     await expect(rpc.getBlockNumber()).rejects.toThrow("Circuit breaker OPEN");
 
     vi.useRealTimers();

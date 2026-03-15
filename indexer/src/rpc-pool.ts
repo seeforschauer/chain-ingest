@@ -13,14 +13,15 @@ export class RpcPool implements RpcEndpoint {
     urls: string[],
     rateLimiter: RateLimiter,
     maxRetries: number,
-    failureThreshold?: number,
-    cooldownMs?: number
+    failureRateThreshold?: number,
+    cooldownMs?: number,
+    windowSize?: number
   ) {
     if (urls.length === 0) {
       throw new Error("RpcPool requires at least one URL");
     }
     this.clients = urls.map(
-      (url) => new RpcClient(url, rateLimiter, maxRetries, failureThreshold, cooldownMs)
+      (url) => new RpcClient(url, rateLimiter, maxRetries, failureRateThreshold, cooldownMs, windowSize)
     );
     log("info", "RPC pool initialized", { endpoints: urls.length });
   }

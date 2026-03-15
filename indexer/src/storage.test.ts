@@ -87,7 +87,7 @@ describe("Storage (mock verification)", () => {
     expect(allSQL).toContain("raw.indexer_state");
     expect(allSQL).toContain("PARTITION BY RANGE");
     expect(allSQL).toContain("BRIN");
-    expect(allSQL).toContain("GIN");
+    expect(allSQL).toContain("idx_logs_topic0");
   });
 
   it("insertBlock uses ON CONFLICT DO NOTHING for idempotency", async () => {
@@ -147,7 +147,7 @@ describe("Storage (mock verification)", () => {
     (storage as any).ensurePartition = vi.fn(async () => {});
 
     // Create a block with 2 transactions, each producing 6000 logs.
-    // Total: 12,000 logs × 6 params = 72,000 > PG's 65,535 limit.
+    // Total: 12,000 logs × 7 params = 84,000 > PG's 65,535 limit.
     // Without per-log chunking, this crashes. With chunking at 5000,
     // it should produce 3 INSERT statements (5000 + 5000 + 2000).
     const makeLogs = (txHash: string, count: number) =>
@@ -192,9 +192,9 @@ describe("Storage (mock verification)", () => {
     );
     expect(logInserts.length).toBeGreaterThanOrEqual(2);
 
-    // Each chunk should have at most 5000 × 6 = 30,000 params
+    // Each chunk should have at most 5000 × 7 = 35,000 params
     for (const q of logInserts) {
-      expect((q.values ?? []).length).toBeLessThanOrEqual(30_000);
+      expect((q.values ?? []).length).toBeLessThanOrEqual(35_000);
     }
   });
 });

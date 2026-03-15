@@ -13,15 +13,19 @@ import { log } from "./logger.js";
 
 const HEARTBEAT_TTL_SEC = 30;
 
+const MAX_TASK_RETRIES = 5;
+
 export interface BlockTask {
   startBlock: number;
   endBlock: number; // inclusive
   assignedTo?: string;
   assignedAt?: number;
+  retryCount?: number;
 }
 
 export class Coordinator {
   private readonly QUEUE_PENDING: string;
+  private readonly QUEUE_DEAD: string;
   private readonly QUEUE_PROCESSING: string;
   private readonly COMPLETED_SET: string;
   private readonly TASK_META: string;
@@ -36,6 +40,7 @@ export class Coordinator {
     const p = `indexer:${chainId}`;
     this.QUEUE_PENDING = `${p}:queue:pending`;
     this.QUEUE_PROCESSING = `${p}:queue:processing`;
+    this.QUEUE_DEAD = `${p}:queue:dead`;
     this.COMPLETED_SET = `${p}:completed_blocks`;
     this.TASK_META = `${p}:task_meta`;
     this.INIT_LOCK = `${p}:init_lock`;
@@ -47,7 +52,9 @@ export class Coordinator {
     toBlock: number,
     batchSize: number
   ): Promise<void> {
-    const acquired = await this.redis.set(this.INIT_LOCK, "1", "EX", 300, "NX");
+    // Lock TTL scales with range size: 300s base + 1s per 100K blocks
+    const lockTtl = 300 + Math.ceil((toBlock - fromBlock) / 100_000);
+    const acquired = await this.redis.set(this.INIT_LOCK, "1", "EX", lockTtl, "NX");
     if (!acquired) {
       log("info", "Queue already initialized by another worker");
       return;
@@ -152,7 +159,6 @@ export class Coordinator {
     }
     await pipeline.exec();
 
-    // Cleanup after write is confirmed
     const clean: BlockTask = { startBlock: task.startBlock, endBlock: task.endBlock };
     const cleanup = this.redis.pipeline();
     cleanup.lrem(this.QUEUE_PROCESSING, 1, JSON.stringify(clean));
@@ -161,17 +167,24 @@ export class Coordinator {
   }
 
   async requeueTask(task: BlockTask): Promise<void> {
-    const clean: BlockTask = {
-      startBlock: task.startBlock,
-      endBlock: task.endBlock,
-    };
-    const raw = JSON.stringify(clean);
+    const retryCount = (task.retryCount ?? 0) + 1;
+    const cleanOriginal: BlockTask = { startBlock: task.startBlock, endBlock: task.endBlock };
+    const originalRaw = JSON.stringify(cleanOriginal);
 
-    // Write before delete — crash between = task in both queues (safe, deduplicated)
-    await this.redis.rpush(this.QUEUE_PENDING, raw);
+    if (retryCount > MAX_TASK_RETRIES) {
+      log("error", "Task exceeded max retries — moving to dead-letter queue", {
+        startBlock: task.startBlock,
+        endBlock: task.endBlock,
+        retryCount,
+      });
+      await this.redis.rpush(this.QUEUE_DEAD, JSON.stringify({ ...cleanOriginal, retryCount }));
+    } else {
+      const requeued: BlockTask = { ...cleanOriginal, retryCount };
+      await this.redis.rpush(this.QUEUE_PENDING, JSON.stringify(requeued));
+    }
 
     const cleanup = this.redis.pipeline();
-    cleanup.lrem(this.QUEUE_PROCESSING, 1, raw);
+    cleanup.lrem(this.QUEUE_PROCESSING, 1, originalRaw);
     cleanup.hdel(this.TASK_META, `${task.startBlock}:${task.endBlock}`);
     await cleanup.exec();
   }
@@ -201,7 +214,7 @@ export class Coordinator {
 
     const now = Date.now();
 
-    // Batch-fetch all metadata in one pipeline
+    // Pipeline avoids N sequential round-trips per processing entry
     const entries: Array<{ raw: string; task: BlockTask; taskKey: string }> = [];
     const metaPipe = this.redis.pipeline();
     for (const raw of processing) {
@@ -212,7 +225,7 @@ export class Coordinator {
     }
     const metaResults = await metaPipe.exec();
 
-    // Collect unique worker IDs that need heartbeat checks
+    // Deduplicate workers — 50 tasks from 1 dead worker = 1 heartbeat check, not 50
     const workerIds = new Set<string>();
     const staleEntries: Array<{
       raw: string; task: BlockTask; taskKey: string;
@@ -237,7 +250,7 @@ export class Coordinator {
 
     if (staleEntries.length === 0) return 0;
 
-    // Batch-fetch heartbeats for all unique workers
+    // Single pipeline for all heartbeat checks — O(unique workers) not O(tasks)
     const aliveWorkers = new Set<string>();
     if (workerIds.size > 0) {
       const heartbeatPipe = this.redis.pipeline();

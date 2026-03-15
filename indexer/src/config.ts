@@ -1,5 +1,3 @@
-// Configuration loaded from environment variables
-
 export interface Config {
   chainId: number;
   redisUrl: string;
@@ -16,6 +14,7 @@ export interface Config {
   endBlock: number | "latest" | "finalized";
   logLevel: "debug" | "info" | "warn" | "error";
   seedOnly: boolean;
+  pgPoolMax: number;
   metricsPort: number | null;
 }
 
@@ -106,6 +105,7 @@ export function loadConfig(): Config {
     endBlock: parseEndBlock(process.env["END_BLOCK"]),
     logLevel: parseLogLevel(process.env["LOG_LEVEL"]),
     seedOnly: process.env["SEED_ONLY"] === "true",
+    pgPoolMax: requirePositiveInt(process.env["PG_POOL_MAX"], "PG_POOL_MAX", 20),
     metricsPort: parseOptionalPort(process.env["METRICS_PORT"]),
   };
 }
