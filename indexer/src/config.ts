@@ -1,7 +1,6 @@
 export interface Config {
   chainId: number;
   redisUrl: string;
-  rpcUrl: string;
   rpcUrls: string[];
   postgresUrl: string;
   batchSize: number;
@@ -89,7 +88,6 @@ export function loadConfig(): Config {
   return {
     chainId: requirePositiveInt(process.env["CHAIN_ID"], "CHAIN_ID", 1),
     redisUrl: process.env["REDIS_URL"] ?? "redis://localhost:6379",
-    rpcUrl,
     rpcUrls: parseRpcUrls(process.env["RPC_URLS"], rpcUrl),
     postgresUrl:
       process.env["POSTGRES_URL"] ??

@@ -15,7 +15,6 @@ describe("loadConfig", () => {
   it("returns defaults when no env vars set", () => {
     const config = loadConfig();
     expect(config.redisUrl).toBe("redis://localhost:6379");
-    expect(config.rpcUrl).toBe("http://localhost:8545");
     expect(config.rpcUrls).toEqual(["http://localhost:8545"]);
     expect(config.batchSize).toBe(10);
     expect(config.flushSize).toBe(1);

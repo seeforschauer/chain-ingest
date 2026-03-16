@@ -31,7 +31,7 @@ async function main() {
   log("info", "Starting chain-ingest", {
     chainId: config.chainId,
     workerId: config.workerId,
-    rpcUrl: config.rpcUrl,
+    rpcUrl: config.rpcUrls[0],
     rpcEndpoints: config.rpcUrls.length,
     batchSize: config.batchSize,
     rateLimit: config.rateLimit,
@@ -47,7 +47,7 @@ async function main() {
   const rateLimiter = new DistributedRateLimiter(redis, config.rateLimit, config.chainId);
   const rpc = config.rpcUrls.length > 1
     ? new RpcPool(config.rpcUrls, rateLimiter, config.maxRetries)
-    : new RpcClient(config.rpcUrl, rateLimiter, config.maxRetries);
+    : new RpcClient(config.rpcUrls[0]!, rateLimiter, config.maxRetries);
 
   let endBlock: number;
   if (config.endBlock === "finalized") {
@@ -95,10 +95,10 @@ async function main() {
   }
 
   const writeBuffer = config.flushSize > 1
-    ? new WriteBuffer(storage, config.flushSize, config.flushIntervalMs)
+    ? new WriteBuffer(storage, config.flushSize, config.flushIntervalMs, metrics)
     : undefined;
 
-  const worker = new Worker(config.workerId, coordinator, rpc, storage, config.chainId, writeBuffer, metrics);
+  const worker = new Worker(config.workerId, coordinator, rpc, storage, config.chainId, writeBuffer, metrics, rateLimiter);
 
   const shutdown = () => {
     log("info", "Shutting down — draining current block...");

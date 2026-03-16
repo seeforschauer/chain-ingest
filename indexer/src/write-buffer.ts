@@ -2,6 +2,7 @@
 
 import type { Storage } from "./storage.js";
 import type { BlockData, ReceiptData } from "./rpc.js";
+import type { Metrics } from "./metrics.js";
 import { log } from "./logger.js";
 
 interface BufferedBlock {
@@ -18,7 +19,8 @@ export class WriteBuffer {
   constructor(
     private readonly storage: Storage,
     private readonly flushSize: number,
-    private readonly flushIntervalMs: number
+    private readonly flushIntervalMs: number,
+    private readonly metrics?: Metrics
   ) {
     if (flushIntervalMs > 0) {
       this.flushTimer = setInterval(() => {
@@ -40,19 +42,32 @@ export class WriteBuffer {
   }
 
   flush(): Promise<void> {
-    this.flushQueue = this.flushQueue.then(() => this.drainBuffer());
+    this.flushQueue = this.flushQueue
+      .then(() => this.drainBuffer())
+      .catch((err) => {
+        // Reset chain after failure so subsequent flushes are not permanently blocked
+        this.flushQueue = Promise.resolve();
+        throw err;
+      });
     return this.flushQueue;
   }
 
   private async drainBuffer(): Promise<void> {
     if (this.buffer.length === 0) return;
     const batch = this.buffer.splice(0);
-    await this.doFlush(batch);
+    try {
+      await this.doFlush(batch);
+    } catch (err) {
+      // Restore data so next flush retries these blocks instead of losing them
+      this.buffer.unshift(...batch);
+      throw err;
+    }
   }
 
   private async doFlush(batch: BufferedBlock[]): Promise<void> {
     log("debug", "Write buffer flushing", { blocks: batch.length });
     await this.storage.insertBlocks(batch);
+    this.metrics?.storageFlushesTotal.inc();
     log("debug", "Write buffer flushed", { blocks: batch.length });
   }
 

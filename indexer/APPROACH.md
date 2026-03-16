@@ -42,13 +42,15 @@
 
 **Dead-letter queue:** Tasks that fail more than 5 times are routed to `queue:dead` instead of being requeued indefinitely. Prevents poison blocks from consuming worker capacity.
 
+**Priority ordering:** Requeued tasks use `lpush` (back of queue) rather than `rpush` (front). Since `brpoplpush` pops from the right, this ensures failing blocks don't starve forward progress on healthy work. Stale task reclamation is batched into a single pipeline for all requeues, then a single pipeline for all cleanups.
+
 ### 2. Distributed Rate Limiting — Shared Adaptive Sliding Window
 
 **Approach:** Lua script implementing a sliding window counter using a Redis sorted set. Each request adds a timestamped entry; entries outside the 1-second window are pruned.
 
 **Adaptive behavior:** On 429 responses, the effective rate drops 25% (via atomic Lua script in Redis — all workers see the reduction simultaneously). After 10 consecutive healthy requests, rate recovers 10%, capped at the configured ceiling. Floors at 1 req/s to prevent complete stall.
 
-**Why shared state in Redis:** Per-worker rate tracking would allow one worker to throttle while others continue over-submitting. Storing `effectiveRate` in Redis ensures all workers for a chain reduce together when any one receives a 429.
+**Why shared state in Redis:** Per-worker rate tracking would allow one worker to throttle while others continue over-submitting. Storing `effectiveRate` in Redis ensures all workers for a chain reduce together when any one receives a 429. **Known limitation:** each worker caches the effective rate locally and passes it to the Lua script. Under sustained 429s, workers can briefly diverge until they refresh from Redis on their next wait cycle. See ARCHITECTURE.md Expert Board BUG 3 for the full analysis.
 
 ### 3. Retry with Backoff + Circuit Breaker
 
@@ -91,13 +93,13 @@ Five tables in a `raw` schema, all data tables range-partitioned by `block_numbe
 
 ### 6. Write Buffer
 
-**Approach:** Configurable batch accumulator (`FLUSH_SIZE`, `FLUSH_INTERVAL_MS`) that buffers N blocks before flushing to PostgreSQL in a single transaction. Reduces PG round-trips by `flushSize×`. Promise-chain serialization prevents concurrent flush races.
+**Approach:** Configurable batch accumulator (`FLUSH_SIZE`, `FLUSH_INTERVAL_MS`) that buffers N blocks before flushing to PostgreSQL in a single transaction. Reduces PG round-trips by `flushSize×`. Promise-chain serialization prevents concurrent flush races. On flush failure, the promise chain resets (subsequent flushes are not permanently blocked) and the batch is restored to the buffer for retry (no data loss from the buffer layer).
 
 **Data safety:** Buffer is flushed before marking any task complete in Redis. On drain (SIGTERM), buffer is flushed before requeuing. On shutdown, `main.ts` performs a final flush before closing connections.
 
 ### 7. Observability
 
-**Prometheus metrics:** Counters (blocks indexed, transactions, RPC calls, errors, storage flushes), gauges (current block, buffer size, queue depth, effective rate), and histograms (RPC duration, storage flush duration, block processing duration). All instrumented in the worker hot path. Served via HTTP on `METRICS_PORT` with `/healthz` for k8s probes.
+**Prometheus metrics:** 5 counters (blocks indexed, transactions, RPC calls, RPC errors, storage flushes), 6 gauges (current block, buffer size, queue pending/processing/completed, effective rate), and 3 histograms (RPC duration, storage flush duration, block processing duration). All 14 metrics instrumented in the worker hot path — no dead metrics. Served via HTTP on `METRICS_PORT` with `/healthz` for k8s probes.
 
 **Structured logging:** JSON to stdout (info/debug/warn) and stderr (error). Level filtering via `LOG_LEVEL`. Per-worker metrics logged every 30 seconds (blocks/sec, uptime, error count).
 
@@ -153,10 +155,10 @@ LOG_LEVEL=debug npm start
 | Redis goes down | Workers crash (by design — Redis is the coordination backbone). On Redis restart, persisted data survives (AOF). PG watermark enables recovery |
 | PostgreSQL goes down | Insert fails, task is requeued. Idempotent inserts handle re-processing when PG recovers |
 | Duplicate blocks | `ON CONFLICT DO NOTHING` on all tables — safe to re-process any block |
-| Block reorgs | Using `finalized` block tag avoids reorgs entirely. `parentHash` chain check halts the task on discontinuity (requeued for retry via different RPC endpoint) |
+| Block reorgs | Using `finalized` block tag avoids reorgs entirely. `parentHash` chain check halts the task on discontinuity (requeued for retry via different RPC endpoint). **Known gap:** parentHash is only verified within a task — cross-task boundary verification requires storing last block hash per chain in Redis (see ARCHITECTURE.md Expert Board BUG 2) |
 | Poison block (always fails) | Dead-letter queue after 5 retries — task moved to `queue:dead` instead of infinite requeue |
 | Slow shutdown | 25-second deadline timer forces exit before k8s SIGKILL (30s default grace period) |
-| Write buffer data loss | Buffer flushed before task completion, before drain, and before shutdown. Only PG-confirmed blocks are marked in Redis |
+| Write buffer data loss | Buffer flushed before task completion, before drain, and before shutdown. On flush failure, batch is restored to buffer for retry. Promise chain resets after error (no permanent stall). Only PG-confirmed blocks are marked in Redis |
 
 ## What I'd Add for Production
 

@@ -145,5 +145,6 @@ All tests use in-memory mocks — no Redis or PostgreSQL required.
 | `logger.ts` | Structured JSON logging, level filtering, stdout/stderr split |
 | `migrate.ts` | Standalone migration script (`npm run migrate`) |
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for design decisions and rationale.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for design decisions, expert board review (5-expert system design deep dive), and code review fixes (SOLID/DRY/KISS).
 See [APPROACH.md](APPROACH.md) for failure scenarios and scale considerations.
+See [REVIEW_CHECKLIST.md](REVIEW_CHECKLIST.md) for the distributed systems review checklist extracted from this project.

@@ -5,8 +5,9 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 ## 1. Operation Ordering in Distributed State
 
 - [ ] **Write before delete**: When moving state between stores (e.g., queue A to queue B), always write to the destination FIRST, then remove from the source. If you crash between steps, the item appears in both (safe, deduplicated via idempotent writes) instead of neither (data loss).
-  - Bad: `lrem(processing)` then `rpush(pending)` — crash between = task vanishes
-  - Good: `rpush(pending)` then `lrem(processing)` — crash between = task in both queues, `isBlockCompleted` skips duplicates
+  - Bad: `lrem(processing)` then `lpush(pending)` — crash between = task vanishes
+  - Good: `lpush(pending)` then `lrem(processing)` — crash between = task in both queues, `isBlockCompleted` skips duplicates
+  - Use `lpush` (not `rpush`) for requeue — places failed tasks at the back of the claim order, preventing poison blocks from starving healthy work
 - [ ] **Apply the pattern uniformly**: If you fix this in `completeTask`, audit `requeueTask`, `reclaimStaleTasks`, and every other method that moves state between stores. Same bug class, same fix.
 
 ## 2. Resource Isolation (Multi-Tenant Keys)
@@ -83,7 +84,7 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 
 ## 13. Circuit Breaker
 
-- [ ] **Don't burn retries when downstream is down**: After N consecutive failures, open the circuit (reject immediately) for a cooldown period. Probe with a single call to detect recovery.
+- [ ] **Don't burn retries when downstream is down**: After a high failure rate (e.g., 60% in a 20-call sliding window), open the circuit (reject immediately) for a cooldown period. Probe with a single call to detect recovery. Windowed tracking is more robust than consecutive counting — a single success should not reset the failure signal.
 - [ ] **One unhealthy chain shouldn't impact others**: At multi-chain scale, circuit breakers prevent retry storms on one chain from consuming the error budget of the other 119.
 - [ ] **429 is NOT an infrastructure failure**: HTTP 429 (rate limited) means the RPC is healthy but overloaded. The rate limiter handles 429s (cut rate 25%). The circuit breaker must NOT count 429s — false circuit opens at 120-chain scale cause cascading stalls where a throttled-but-healthy endpoint triggers 30s cooldown.
 - [ ] **Use typed errors or flags, not string matching**: Distinguishing error classes by parsing `error.message` is fragile. Use a boolean flag scoped to the attempt, or a typed error class. Message text is for humans, not control flow.
@@ -103,7 +104,7 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 
 - [ ] **After fixing any bug, grep for the same pattern across the entire codebase**: The write-before-delete bug appeared in 4 callsites. Fixing it in one place while missing three others is worse than not fixing it at all — it shows you understood the problem but didn't apply it systematically.
   - Method: `grep lrem` (or whatever the operation is) → audit every callsite
-  - This took 3 review rounds to fully catch. One `grep` after Round 7 would have found all 4 in one pass.
+  - This took multiple review rounds to fully catch. One `grep` after the first fix would have found all 4 in one pass.
 - [ ] **Same principle for scoping/isolation**: After scoping one Redis key by chainId, grep for all remaining bare key literals.
 - [ ] **Same principle for strict parsing**: After fixing `parseInt` → `Number()` in one parser, audit every other `parseInt` in config.
 

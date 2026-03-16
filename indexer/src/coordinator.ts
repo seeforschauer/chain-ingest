@@ -179,8 +179,10 @@ export class Coordinator {
       });
       await this.redis.rpush(this.QUEUE_DEAD, JSON.stringify({ ...cleanOriginal, retryCount }));
     } else {
+      // lpush: requeued tasks go to the back of the claim order (brpoplpush pops from right)
+      // Prevents failing blocks from starving forward progress on healthy blocks
       const requeued: BlockTask = { ...cleanOriginal, retryCount };
-      await this.redis.rpush(this.QUEUE_PENDING, JSON.stringify(requeued));
+      await this.redis.lpush(this.QUEUE_PENDING, JSON.stringify(requeued));
     }
 
     const cleanup = this.redis.pipeline();
@@ -266,7 +268,8 @@ export class Coordinator {
       }
     }
 
-    let reclaimed = 0;
+    // Filter to reclaimable entries and log decisions
+    const toReclaim: Array<{ raw: string; taskKey: string }> = [];
     for (const { raw, task, taskKey, assignedTo, assignedAt } of staleEntries) {
       if (!assignedTo) {
         log("warn", "Reclaiming orphaned task (no metadata)", {
@@ -287,17 +290,27 @@ export class Coordinator {
           staleSec: Math.round((now - (assignedAt ?? now)) / 1000),
         });
       }
-
-      // Write before delete
-      await this.redis.rpush(this.QUEUE_PENDING, raw);
-      const cleanup = this.redis.pipeline();
-      cleanup.lrem(this.QUEUE_PROCESSING, 1, raw);
-      cleanup.hdel(this.TASK_META, taskKey);
-      await cleanup.exec();
-      reclaimed++;
+      toReclaim.push({ raw, taskKey });
     }
 
-    return reclaimed;
+    if (toReclaim.length === 0) return 0;
+
+    // Batched pipeline: write-before-delete, then cleanup
+    // lpush: reclaimed tasks go to back of claim order to avoid priority inversion
+    const requeuePipe = this.redis.pipeline();
+    for (const { raw } of toReclaim) {
+      requeuePipe.lpush(this.QUEUE_PENDING, raw);
+    }
+    await requeuePipe.exec();
+
+    const cleanupPipe = this.redis.pipeline();
+    for (const { raw, taskKey } of toReclaim) {
+      cleanupPipe.lrem(this.QUEUE_PROCESSING, 1, raw);
+      cleanupPipe.hdel(this.TASK_META, taskKey);
+    }
+    await cleanupPipe.exec();
+
+    return toReclaim.length;
   }
 
   /** Evict completed entries below watermark — prevents unbounded sorted-set growth. */

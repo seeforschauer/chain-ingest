@@ -27,6 +27,7 @@ const RATE_LIMIT_SCRIPT = `
 export interface RateLimiter {
   acquire(): Promise<void>;
   recordThrottle?(): void;
+  readonly effectiveRate?: number;
 }
 
 const THROTTLE_REDUCTION = 0.75;
@@ -123,6 +124,10 @@ export class DistributedRateLimiter implements RateLimiter {
       const waitMs = 20 + Math.random() * 30;
       await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
+  }
+
+  get effectiveRate(): number {
+    return this.cachedEffectiveRate;
   }
 
   recordThrottle(): void {

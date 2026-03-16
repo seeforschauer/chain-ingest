@@ -5,7 +5,7 @@
 ```bash
 cd indexer
 npm install
-npm test              # 87 tests, ~3s
+npm test              # 89 tests, ~3s
 npm run typecheck     # TypeScript strict check
 ```
 

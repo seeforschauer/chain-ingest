@@ -6,7 +6,7 @@ import { log } from "./logger.js";
 
 async function main() {
   const config = loadConfig();
-  const storage = new Storage(config.postgresUrl);
+  const storage = new Storage(config.postgresUrl, config.pgPoolMax);
 
   log("info", "Running migration...");
   await storage.migrate();

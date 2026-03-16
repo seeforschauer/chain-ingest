@@ -6,6 +6,18 @@ import { log } from "./logger.js";
 
 const PARTITION_RANGE = 1_000_000; // ~2 weeks on Ethereum mainnet
 const BATCH_CHUNK_SIZE = 5_000;    // PG max 65,535 params; 5K × 10 cols = 50K
+const DATA_TABLES = ["raw.blocks", "raw.transactions", "raw.receipts", "raw.logs"] as const;
+
+/** Build parameterized placeholder string for multi-row INSERT. */
+function buildPlaceholders(cols: number, rowCount: number): string {
+  const rows: string[] = [];
+  for (let i = 0; i < rowCount; i++) {
+    const base = i * cols;
+    const params = Array.from({ length: cols }, (_, j) => `$${base + j + 1}`);
+    rows.push(`(${params.join(", ")})`);
+  }
+  return rows.join(", ");
+}
 
 export class Storage {
   private pool: Pool;
@@ -114,10 +126,9 @@ export class Storage {
     try {
       const partitionCeiling = Math.ceil((endBlock + 1) / PARTITION_RANGE) * PARTITION_RANGE;
       for (let start = 0; start < partitionCeiling; start += PARTITION_RANGE) {
-        await this.createPartitionIfNotExists(ddlClient, "raw.blocks", start);
-        await this.createPartitionIfNotExists(ddlClient, "raw.transactions", start);
-        await this.createPartitionIfNotExists(ddlClient, "raw.receipts", start);
-        await this.createPartitionIfNotExists(ddlClient, "raw.logs", start);
+        for (const table of DATA_TABLES) {
+          await this.createPartitionIfNotExists(ddlClient, table, start);
+        }
       }
 
       // BRIN for physically ordered data (~100x smaller than B-tree)
@@ -198,10 +209,9 @@ export class Storage {
     // DDL outside main transaction to avoid deadlocks with concurrent workers
     const client = await this.pool.connect();
     try {
-      await this.createPartitionIfNotExists(client, "raw.blocks", rangeStart);
-      await this.createPartitionIfNotExists(client, "raw.transactions", rangeStart);
-      await this.createPartitionIfNotExists(client, "raw.receipts", rangeStart);
-      await this.createPartitionIfNotExists(client, "raw.logs", rangeStart);
+      for (const table of DATA_TABLES) {
+        await this.createPartitionIfNotExists(client, table, rangeStart);
+      }
       this.knownPartitions.add(cacheKey);
     } finally {
       client.release();
@@ -308,14 +318,7 @@ export class Storage {
     blockNumber: number
   ): Promise<void> {
     const values: unknown[] = [];
-    const placeholders: string[] = [];
-
-    for (let i = 0; i < transactions.length; i++) {
-      const tx = transactions[i]!;
-      const offset = i * 10;
-      placeholders.push(
-        `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10})`
-      );
+    for (const tx of transactions) {
       values.push(
         tx.hash,
         blockNumber,
@@ -334,7 +337,7 @@ export class Storage {
       `INSERT INTO raw.transactions
         (tx_hash, block_number, tx_index, from_address, to_address,
          value, gas_price, gas_limit, input_data, nonce)
-       VALUES ${placeholders.join(", ")}
+       VALUES ${buildPlaceholders(10, transactions.length)}
        ON CONFLICT (block_number, tx_hash) DO NOTHING`,
       values
     );
@@ -347,17 +350,12 @@ export class Storage {
     blockNumber: number
   ): Promise<void> {
     const values: unknown[] = [];
-    const placeholders: string[] = [];
-    let paramIdx = 0;
+    let rowCount = 0;
 
     for (const tx of transactions) {
       const receipt = receiptMap.get(tx.hash);
       if (!receipt) continue;
 
-      const offset = paramIdx * 7;
-      placeholders.push(
-        `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`
-      );
       values.push(
         receipt.transactionHash,
         blockNumber,
@@ -367,16 +365,16 @@ export class Storage {
         receipt.contractAddress,
         receipt.logs.length
       );
-      paramIdx++;
+      rowCount++;
     }
 
-    if (placeholders.length === 0) return;
+    if (rowCount === 0) return;
 
     await client.query(
       `INSERT INTO raw.receipts
         (tx_hash, block_number, status, gas_used, cumulative_gas_used,
          contract_address, log_count)
-       VALUES ${placeholders.join(", ")}
+       VALUES ${buildPlaceholders(7, rowCount)}
        ON CONFLICT (block_number, tx_hash) DO NOTHING`,
       values
     );
@@ -391,18 +389,26 @@ export class Storage {
     // Logs have 1:N fanout from transactions (DeFi swaps emit 5-10 each).
     // Chunking by tx count doesn't bound log count — flush per-log instead.
     let values: unknown[] = [];
-    let placeholders: string[] = [];
-    let paramIdx = 0;
+    let rowCount = 0;
+
+    const flushLogs = async () => {
+      if (rowCount === 0) return;
+      await client.query(
+        `INSERT INTO raw.logs
+          (tx_hash, log_index, address, topic0, topics, data, block_number)
+         VALUES ${buildPlaceholders(7, rowCount)}
+         ON CONFLICT (block_number, tx_hash, log_index) DO NOTHING`,
+        values
+      );
+      values = [];
+      rowCount = 0;
+    };
 
     for (const tx of transactions) {
       const receipt = receiptMap.get(tx.hash);
       if (!receipt) continue;
 
       for (const logEntry of receipt.logs) {
-        const offset = paramIdx * 7;
-        placeholders.push(
-          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`
-        );
         values.push(
           logEntry.transactionHash,
           parseInt(logEntry.logIndex, 16),
@@ -412,32 +418,15 @@ export class Storage {
           logEntry.data,
           blockNumber
         );
-        paramIdx++;
+        rowCount++;
 
-        if (paramIdx >= BATCH_CHUNK_SIZE) {
-          await client.query(
-            `INSERT INTO raw.logs
-              (tx_hash, log_index, address, topic0, topics, data, block_number)
-             VALUES ${placeholders.join(", ")}
-             ON CONFLICT (block_number, tx_hash, log_index) DO NOTHING`,
-            values
-          );
-          values = [];
-          placeholders = [];
-          paramIdx = 0;
+        if (rowCount >= BATCH_CHUNK_SIZE) {
+          await flushLogs();
         }
       }
     }
 
-    if (placeholders.length === 0) return;
-
-    await client.query(
-      `INSERT INTO raw.logs
-        (tx_hash, log_index, address, topic0, topics, data, block_number)
-       VALUES ${placeholders.join(", ")}
-       ON CONFLICT (block_number, tx_hash, log_index) DO NOTHING`,
-      values
-    );
+    await flushLogs();
   }
 
   async updateWatermark(

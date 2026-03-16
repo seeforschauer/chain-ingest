@@ -40,6 +40,14 @@ export function createMockRedis() {
           return count;
         });
       },
+      rpush: (key: string, val: string) => {
+        ops.push(() => {
+          const list = store.lists.get(key) ?? [];
+          list.push(val);
+          store.lists.set(key, list);
+          return list.length;
+        });
+      },
       lrem: (key: string, _count: number, val: string) => {
         ops.push(() => {
           const list = store.lists.get(key) ?? [];

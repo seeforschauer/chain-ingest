@@ -2,6 +2,7 @@
 
 import type { Coordinator, BlockTask } from "./coordinator.js";
 import type { RpcEndpoint } from "./rpc.js";
+import type { RateLimiter } from "./rate-limiter.js";
 import type { Storage } from "./storage.js";
 import type { WriteBuffer } from "./write-buffer.js";
 import type { Metrics } from "./metrics.js";
@@ -32,7 +33,8 @@ export class Worker {
     private readonly storage: Storage,
     private readonly chainId: number = 1,
     private readonly writeBuffer?: WriteBuffer,
-    private readonly promMetrics?: Metrics
+    private readonly promMetrics?: Metrics,
+    private readonly rateLimiter?: RateLimiter
   ) {
     this.metrics = {
       blocksIndexed: 0,
@@ -178,6 +180,14 @@ export class Worker {
       const now = Date.now();
       if (now - this.lastStatsAt > 30_000) {
         const stats = await this.coordinator.getStats();
+        if (this.promMetrics) {
+          this.promMetrics.queuePending.set(stats.pending);
+          this.promMetrics.queueProcessing.set(stats.processing);
+          this.promMetrics.queueCompleted.set(stats.completed);
+          if (this.rateLimiter?.effectiveRate !== undefined) {
+            this.promMetrics.rateLimiterEffectiveRate.set(this.rateLimiter.effectiveRate);
+          }
+        }
         log("info", "Task completed", {
           workerId: this.workerId,
           startBlock,
@@ -194,6 +204,7 @@ export class Worker {
       }
     } catch (err) {
       this.metrics.errors++;
+      this.promMetrics?.rpcErrorsTotal.inc({ error_type: "task_failure" });
       this.currentBlock = null;
 
       // Only mark blocks confirmed durable in PG — never mark buffered-but-unflushed
@@ -238,8 +249,10 @@ export class Worker {
     const storageStart = Date.now();
     if (this.writeBuffer) {
       await this.writeBuffer.add(block, receipts, this.workerId);
+      this.promMetrics?.bufferSize.set(this.writeBuffer.pending);
     } else {
       await this.storage.insertBlock(block, receipts, this.workerId);
+      this.promMetrics?.storageFlushesTotal.inc();
     }
     this.promMetrics?.storageFlushDurationSeconds.observe((Date.now() - storageStart) / 1000);
     this.promMetrics?.blocksIndexedTotal.inc();

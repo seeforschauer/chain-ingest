@@ -15,8 +15,11 @@ export function startMetricsServer(
         res.writeHead(200, { "Content-Type": registry.contentType });
         res.end(metrics);
       } catch (err) {
+        log("error", "Failed to serialize metrics", {
+          error: err instanceof Error ? err.message : String(err),
+        });
         res.writeHead(500);
-        res.end();
+        res.end("metrics serialization error");
       }
       return;
     }
