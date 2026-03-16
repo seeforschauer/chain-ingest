@@ -1,6 +1,6 @@
 // PostgreSQL storage with batch inserts, range partitioning, and BRIN indexes.
 
-import { Pool, type PoolClient } from "pg";
+import { Pool, type PoolClient, escapeIdentifier } from "pg";
 import type { BlockData, TransactionData, ReceiptData } from "./rpc.js";
 import { log } from "./logger.js";
 
@@ -89,7 +89,6 @@ export class Storage {
       // add write overhead; data is always inserted atomically in one transaction)
       await client.query(`
         CREATE TABLE IF NOT EXISTS raw.logs (
-          id               BIGSERIAL,
           tx_hash          TEXT NOT NULL,
           log_index        INT NOT NULL,
           address          TEXT NOT NULL,
@@ -97,8 +96,7 @@ export class Storage {
           topics           JSONB NOT NULL,
           data             TEXT NOT NULL,
           block_number     BIGINT NOT NULL,
-          PRIMARY KEY (block_number, id),
-          UNIQUE (block_number, tx_hash, log_index)
+          PRIMARY KEY (block_number, tx_hash, log_index)
         ) PARTITION BY RANGE (block_number)
       `);
 
@@ -134,26 +132,16 @@ export class Storage {
       // BRIN for physically ordered data (~100x smaller than B-tree)
       await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_blocks_timestamp
         ON raw.blocks USING BRIN (block_timestamp)`);
-      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_tx_block
-        ON raw.transactions USING BRIN (block_number)`);
-      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_rcpt_block
-        ON raw.receipts USING BRIN (block_number)`);
-      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_block
-        ON raw.logs USING BRIN (block_number)`);
 
       // B-tree for address lookups — BRIN doesn't help here (no physical correlation)
       await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_tx_from
         ON raw.transactions (from_address)`);
       await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_tx_to
         ON raw.transactions (to_address)`);
-      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_address
-        ON raw.logs (address)`);
 
-      // B-tree on topic0 (event signature) — covers 90% of log queries.
-      // GIN on full JSONB dropped: highest write amplification in PG.
-      // If multi-topic containment is needed, add GIN with jsonb_path_ops.
-      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_topic0
-        ON raw.logs (topic0)`);
+      // Composite (address, topic0) covers the dominant DeFi query pattern
+      await ddlClient.query(`CREATE INDEX IF NOT EXISTS idx_logs_addr_topic
+        ON raw.logs (address, topic0)`);
 
       log("info", "Schema migration complete");
     } finally {
@@ -168,12 +156,14 @@ export class Storage {
   ): Promise<void> {
     const rangeEnd = rangeStart + PARTITION_RANGE;
     const suffix = `p${rangeStart}_${rangeEnd}`;
-    const partitionName = `${parentTable.replace(".", "_")}_${suffix}`;
+    const [schema, table] = parentTable.split(".");
+    const partitionName = `${escapeIdentifier(schema)}.${escapeIdentifier(`${schema}_${table}_${suffix}`)}`;
+    const escapedParent = `${escapeIdentifier(schema)}.${escapeIdentifier(table)}`;
 
     try {
       await client.query(`
         CREATE TABLE IF NOT EXISTS ${partitionName}
-          PARTITION OF ${parentTable}
+          PARTITION OF ${escapedParent}
           FOR VALUES FROM (${rangeStart}) TO (${rangeEnd})
       `);
     } catch (err: any) {
@@ -196,8 +186,9 @@ export class Storage {
     const logsSuffix = `raw_logs_p${rangeStart}_${rangeEnd}`;
 
     const { rows } = await this.pool.query(
-      `SELECT relname FROM pg_class
-       WHERE relname IN ($1, $2, $3, $4)`,
+      `SELECT c.relname FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'raw' AND c.relname IN ($1, $2, $3, $4)`,
       [blocksSuffix, txSuffix, rcptSuffix, logsSuffix]
     );
 
@@ -359,7 +350,7 @@ export class Storage {
       values.push(
         receipt.transactionHash,
         blockNumber,
-        receipt.status ? parseInt(receipt.status, 16) : null,
+        receipt.status != null ? parseInt(receipt.status, 16) : null,
         hexToBigInt(receipt.gasUsed),
         hexToBigInt(receipt.cumulativeGasUsed),
         receipt.contractAddress,

@@ -122,7 +122,8 @@ export function createMockRedis() {
       store.lists.set(key, list);
       return list.length;
     }),
-    brpoplpush: vi.fn(async (src: string, dst: string, _timeout?: number) => {
+    blmove: vi.fn(async (src: string, dst: string, _srcDir: string, _dstDir: string, _timeout?: number) => {
+      // RIGHT+LEFT semantics (equivalent to deprecated brpoplpush)
       const srcList = store.lists.get(src) ?? [];
       if (srcList.length === 0) return null;
       const val = srcList.pop()!;
@@ -185,6 +186,22 @@ export function createMockRedis() {
         if (score >= min && score <= max) { set.delete(member); removed++; }
       }
       return removed;
+    }),
+    hscan: vi.fn(async (key: string, _cursor: string, ..._args: unknown[]) => {
+      const hash = store.hashes.get(key);
+      if (!hash) return ["0", []];
+      // Simple mock: return all fields in one scan (cursor always "0" = done)
+      const fields: string[] = [];
+      for (const [field, val] of hash) {
+        fields.push(field, val);
+      }
+      return ["0", fields];
+    }),
+    time: vi.fn(async () => {
+      const now = Date.now();
+      const seconds = Math.floor(now / 1000).toString();
+      const microseconds = ((now % 1000) * 1000).toString();
+      return [seconds, microseconds];
     }),
     pipeline,
   } as any;

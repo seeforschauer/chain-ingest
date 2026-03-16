@@ -5,7 +5,7 @@
 ```bash
 cd indexer
 npm install
-npm test              # 89 tests, ~3s
+npm test              # 121 tests, ~3s
 npm run typecheck     # TypeScript strict check
 ```
 
@@ -74,7 +74,7 @@ npm start &
 sleep 5
 kill -9 $!
 
-# Restart — should resume from where it left off
+# Restart — resumes from where it left off
 npm start
 
 # Verify: no duplicate blocks in PostgreSQL
@@ -88,14 +88,14 @@ docker exec -it $(docker ps -q -f name=postgres) psql -U indexer -c \
 npm start &
 sleep 3
 kill $!    # sends SIGTERM
-# Logs should show "Drain requested" then "Worker stopped"
+# Logs show "Drain requested" then "Worker stopped"
 ```
 
 ## 9. Seed-only mode
 
 ```bash
 SEED_ONLY=true npm start
-# Should seed the Redis queue and exit immediately
+# Seeds the Redis queue and exits immediately
 # Then start workers separately:
 npm start
 ```

@@ -139,10 +139,12 @@ describe("High-load: Coordinator", () => {
 describe("High-load: Worker", () => {
   function createMockCoordinator() {
     const completedBlocks = new Set<number>();
+    const blockHashes = new Map<number, string>();
     let taskQueue: BlockTask[] = [];
 
     return {
       completedBlocks,
+      blockHashes,
       setTasks: (tasks: BlockTask[]) => { taskQueue = [...tasks]; },
       updateHeartbeat: vi.fn(async () => {}),
       reclaimStaleTasks: vi.fn(async () => 0),
@@ -170,6 +172,23 @@ describe("High-load: Worker", () => {
         completed: completedBlocks.size,
       })),
       evictCompletedBelow: vi.fn(async () => 0),
+      getLastBlockHash: vi.fn(async (blockNumber: number) => {
+        return blockHashes.get(blockNumber) ?? null;
+      }),
+      setLastBlockHash: vi.fn(async (blockNumber: number, hash: string) => {
+        blockHashes.set(blockNumber, hash);
+      }),
+      getContiguousWatermark: vi.fn(async (currentWatermark: number) => {
+        let contiguous = currentWatermark - 1;
+        for (let b = currentWatermark; ; b++) {
+          if (completedBlocks.has(b)) {
+            contiguous = b;
+          } else {
+            break;
+          }
+        }
+        return contiguous;
+      }),
     } as any;
   }
 

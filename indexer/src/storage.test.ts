@@ -87,7 +87,7 @@ describe("Storage (mock verification)", () => {
     expect(allSQL).toContain("raw.indexer_state");
     expect(allSQL).toContain("PARTITION BY RANGE");
     expect(allSQL).toContain("BRIN");
-    expect(allSQL).toContain("idx_logs_topic0");
+    expect(allSQL).toContain("idx_logs_addr_topic");
   });
 
   it("insertBlock uses ON CONFLICT DO NOTHING for idempotency", async () => {

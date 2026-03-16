@@ -53,6 +53,22 @@ export interface RpcEndpoint {
   ): Promise<{ block: BlockData; receipts: ReceiptData[] }>;
 }
 
+/** JSON-RPC error with the original numeric error code preserved. */
+export class JsonRpcError extends Error {
+  constructor(
+    public readonly code: number,
+    message: string
+  ) {
+    super(`RPC error ${code}: ${message}`);
+    this.name = "JsonRpcError";
+  }
+}
+
+/** Returns true if the error is a JSON-RPC "method not found" (-32601). */
+export function isMethodNotSupported(err: unknown): boolean {
+  return err instanceof JsonRpcError && err.code === -32601;
+}
+
 interface JsonRpcResponse<T> {
   jsonrpc: string;
   id: number;
@@ -64,6 +80,7 @@ const METHOD_TIMEOUTS: Record<string, number> = {
   eth_blockNumber: 10_000,
   eth_getBlockByNumber: 15_000,
   eth_getBlockReceipts: 30_000,
+  eth_getTransactionReceipt: 15_000,
 };
 const DEFAULT_TIMEOUT = 15_000;
 
@@ -79,8 +96,14 @@ export class RpcClient implements RpcEndpoint {
   private circuitOpenedAt = 0;
   private readonly failureRateThreshold: number;
   private readonly windowSize: number;
-  private readonly outcomeWindow: boolean[] = [];
   private readonly cooldownMs: number;
+
+  // Ring buffer for O(1) outcome tracking (replaces O(n) array.shift + filter)
+  private readonly outcomeRing: boolean[];
+  private ringHead = 0;
+  private ringCount = 0;
+  private failureCount = 0;
+  private supportsBlockReceipts = true;
 
   constructor(
     private readonly url: string,
@@ -93,6 +116,7 @@ export class RpcClient implements RpcEndpoint {
     this.failureRateThreshold = failureRateThreshold;
     this.cooldownMs = cooldownMs;
     this.windowSize = windowSize;
+    this.outcomeRing = new Array<boolean>(windowSize);
   }
 
   private checkCircuit(): void {
@@ -114,10 +138,15 @@ export class RpcClient implements RpcEndpoint {
   }
 
   private recordOutcome(success: boolean): void {
-    this.outcomeWindow.push(success);
-    if (this.outcomeWindow.length > this.windowSize) {
-      this.outcomeWindow.shift();
+    if (this.ringCount === this.windowSize) {
+      // Evict the oldest entry from the ring
+      if (!this.outcomeRing[this.ringHead]) this.failureCount--;
+    } else {
+      this.ringCount++;
     }
+    this.outcomeRing[this.ringHead] = success;
+    if (!success) this.failureCount++;
+    this.ringHead = (this.ringHead + 1) % this.windowSize;
   }
 
   private onSuccess(): void {
@@ -140,14 +169,13 @@ export class RpcClient implements RpcEndpoint {
       return;
     }
 
-    if (this.outcomeWindow.length >= this.windowSize) {
-      const failures = this.outcomeWindow.filter((v) => !v).length;
-      if (failures / this.windowSize >= this.failureRateThreshold) {
+    if (this.ringCount >= this.windowSize) {
+      if (this.failureCount / this.windowSize >= this.failureRateThreshold) {
         this.circuitState = CircuitState.OPEN;
         this.circuitOpenedAt = Date.now();
         log("warn", "Circuit breaker OPEN", {
           url: this.url,
-          failureRate: (failures / this.windowSize * 100).toFixed(0) + "%",
+          failureRate: (this.failureCount / this.windowSize * 100).toFixed(0) + "%",
           cooldownMs: this.cooldownMs,
         });
       }
@@ -228,7 +256,7 @@ export class RpcClient implements RpcEndpoint {
       async (res) => {
         const json = (await res.json()) as JsonRpcResponse<T>;
         if (json.error) {
-          throw new Error(`RPC error ${json.error.code}: ${json.error.message}`);
+          throw new JsonRpcError(json.error.code, json.error.message);
         }
         return json.result as T;
       },
@@ -282,7 +310,7 @@ export class RpcClient implements RpcEndpoint {
           const resp = byId.get(id);
           if (!resp) throw new Error(`RPC batch: missing response for id ${id}`);
           if (resp.error) {
-            throw new Error(`RPC batch error ${resp.error.code}: ${resp.error.message}`);
+            throw new JsonRpcError(resp.error.code, resp.error.message);
           }
           results.push(resp.result);
         }
@@ -310,12 +338,47 @@ export class RpcClient implements RpcEndpoint {
     blockNumber: number
   ): Promise<{ block: BlockData; receipts: ReceiptData[] }> {
     const hex = "0x" + blockNumber.toString(16);
-    const [block, receipts] = await this.batchCall<[BlockData, ReceiptData[]]>([
-      { method: "eth_getBlockByNumber", params: [hex, true] },
-      { method: "eth_getBlockReceipts", params: [hex] },
-    ]);
+
+    if (this.supportsBlockReceipts) {
+      try {
+        const [block, receipts] = await this.batchCall<[BlockData, ReceiptData[]]>([
+          { method: "eth_getBlockByNumber", params: [hex, true] },
+          { method: "eth_getBlockReceipts", params: [hex] },
+        ]);
+        if (!block) throw new Error(`Block ${blockNumber} not found (null from RPC)`);
+        return { block, receipts: receipts ?? [] };
+      } catch (err) {
+        if (!isMethodNotSupported(err)) throw err;
+        this.supportsBlockReceipts = false;
+        log("warn", "eth_getBlockReceipts not supported (-32601), falling back to per-tx receipts");
+      }
+    }
+
+    // Fallback: fetch block then individual receipts per transaction
+    const block = await this.call<BlockData>(
+      "eth_getBlockByNumber",
+      [hex, true]
+    );
     if (!block) throw new Error(`Block ${blockNumber} not found (null from RPC)`);
-    return { block, receipts: receipts ?? [] };
+
+    const receipts: ReceiptData[] = [];
+    if (block.transactions.length > 0) {
+      // Chunk per-tx receipt calls to stay within provider batch limits (L2 blocks can have 1000+ txs)
+      const RECEIPT_BATCH_SIZE = 100;
+      for (let i = 0; i < block.transactions.length; i += RECEIPT_BATCH_SIZE) {
+        const chunk = block.transactions.slice(i, i + RECEIPT_BATCH_SIZE);
+        const receiptCalls = chunk.map((tx) => ({
+          method: "eth_getTransactionReceipt",
+          params: [tx.hash],
+        }));
+        const receiptResults = await this.batchCall<ReceiptData[]>(receiptCalls);
+        for (const receipt of receiptResults) {
+          if (receipt) receipts.push(receipt);
+        }
+      }
+    }
+
+    return { block, receipts };
   }
 }
 

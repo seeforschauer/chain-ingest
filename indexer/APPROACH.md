@@ -30,10 +30,10 @@
 
 ### 1. Work Distribution — Redis List Queue
 
-**Approach:** Block ranges are pushed to a Redis list (`pending`). Workers atomically pop tasks using `BRPOPLPUSH` into a `processing` list. On completion, tasks are removed from processing and individual blocks are marked in a sorted set.
+**Approach:** Block ranges are pushed to a Redis list (`pending`). Workers atomically pop tasks using `BLMOVE` into a `processing` list. On completion, tasks are removed from processing and individual blocks are marked in a sorted set.
 
 **Why this over alternatives:**
-- `BRPOPLPUSH` is atomic — no risk of two workers claiming the same task
+- `BLMOVE` is atomic — no risk of two workers claiming the same task
 - Blocking pop avoids busy polling
 - Processing list enables stale task detection — if a worker crashes, its task stays in `processing` and can be reclaimed after a timeout
 - Sorted set of completed blocks enables gap detection and resume-after-restart
@@ -42,7 +42,7 @@
 
 **Dead-letter queue:** Tasks that fail more than 5 times are routed to `queue:dead` instead of being requeued indefinitely. Prevents poison blocks from consuming worker capacity.
 
-**Priority ordering:** Requeued tasks use `lpush` (back of queue) rather than `rpush` (front). Since `brpoplpush` pops from the right, this ensures failing blocks don't starve forward progress on healthy work. Stale task reclamation is batched into a single pipeline for all requeues, then a single pipeline for all cleanups.
+**Priority ordering:** Requeued tasks use `lpush` (back of queue) rather than `rpush` (front). Since `BLMOVE` pops from the right, this ensures failing blocks don't starve forward progress on healthy work. Stale task reclamation is batched into a single pipeline for all requeues, then a single pipeline for all cleanups.
 
 ### 2. Distributed Rate Limiting — Shared Adaptive Sliding Window
 
@@ -50,13 +50,13 @@
 
 **Adaptive behavior:** On 429 responses, the effective rate drops 25% (via atomic Lua script in Redis — all workers see the reduction simultaneously). After 10 consecutive healthy requests, rate recovers 10%, capped at the configured ceiling. Floors at 1 req/s to prevent complete stall.
 
-**Why shared state in Redis:** Per-worker rate tracking would allow one worker to throttle while others continue over-submitting. Storing `effectiveRate` in Redis ensures all workers for a chain reduce together when any one receives a 429. **Known limitation:** each worker caches the effective rate locally and passes it to the Lua script. Under sustained 429s, workers can briefly diverge until they refresh from Redis on their next wait cycle. See ARCHITECTURE.md Expert Board BUG 3 for the full analysis.
+**Why shared state in Redis:** Per-worker rate tracking would allow one worker to throttle while others continue over-submitting. Storing `effectiveRate` and `healthyStreak` in Redis ensures all workers for a chain reduce together when any one receives a 429. Each worker caches the effective rate locally and passes it to the Lua script. Under sustained 429s, workers can briefly diverge until they refresh from Redis on their next wait cycle.
 
 ### 3. Retry with Backoff + Circuit Breaker
 
 **Backoff:** `delay = min(1s * 2^attempt, 30s) + random(0-1s)`. Jitter prevents thundering herd.
 
-**Circuit breaker:** Windowed failure rate tracking (20-call sliding window, trips at 60% failure rate). When open, rejects calls immediately for a cooldown period, then allows one probe call. 429 responses are explicitly excluded from the failure window — a 429 means the RPC is healthy but overloaded, and the rate limiter handles it.
+**Circuit breaker:** Ring buffer failure rate tracking (20-call sliding window, trips at 60% failure rate). When open, rejects calls immediately for a cooldown period, then allows one probe call. 429 responses are explicitly excluded from the failure window — a 429 means the RPC is healthy but overloaded, and the rate limiter handles it.
 
 **RPC pool failover:** When multiple endpoints are configured (`RPC_URLS`), requests are distributed round-robin. If one endpoint's circuit opens or retries exhaust, the pool automatically fails over to the next endpoint. Each endpoint maintains independent circuit breaker state.
 
@@ -65,7 +65,9 @@
 **Three-layer persistence:**
 1. **Redis sorted set** — tracks every completed block number. Entries below the PG watermark are evicted to bound Redis memory.
 2. **Redis processing list** — tracks in-flight tasks. Stale tasks are reclaimed via pipelined heartbeat checks after 2 minutes.
-3. **PostgreSQL** — source of truth. `ON CONFLICT DO NOTHING` makes inserts idempotent. Per-chain high-water mark in `raw.indexer_state` survives Redis flushes.
+3. **PostgreSQL** — source of truth. `ON CONFLICT DO NOTHING` makes inserts idempotent. Per-chain contiguous high-water mark in `raw.indexer_state` survives Redis flushes.
+
+**Contiguous watermark:** The watermark only advances to the highest contiguous completed block, scanning forward from the current watermark and stopping at the first gap. This prevents the watermark from jumping past unfinished blocks when out-of-order tasks complete.
 
 **Partial progress:** When a task partially completes and fails, only blocks confirmed durable in PostgreSQL (not just buffered) are marked as completed. The write buffer flush-before-complete ordering ensures no data gap between Redis progress and PG content.
 
@@ -80,8 +82,8 @@ Five tables in a `raw` schema, all data tables range-partitioned by `block_numbe
 | `raw.blocks` | `block_number` | Partitioned, stores `indexed_by` worker ID for debugging |
 | `raw.transactions` | `(block_number, tx_hash)` | Partitioned, B-tree on `from`/`to` for address lookups |
 | `raw.receipts` | `(block_number, tx_hash)` | Partitioned, `block_number` denormalized for co-partitioning |
-| `raw.logs` | `(block_number, id)` | Partitioned, B-tree on `topic0` + `address`, UNIQUE on `(block_number, tx_hash, log_index)` |
-| `raw.indexer_state` | `chain_id` | High-water mark per chain, survives Redis flushes |
+| `raw.logs` | `(block_number, tx_hash, log_index)` | Partitioned, composite B-tree on `(address, topic0)` |
+| `raw.indexer_state` | `chain_id` | Contiguous high-water mark per chain, survives Redis flushes |
 
 **Why BIGINT for gas, NUMERIC for value:** Gas values fit in BIGINT (max ~2^32), saving 40-60 bytes per row vs NUMERIC. Token values (`value` field) can exceed 2^64, so NUMERIC preserves full EVM uint256 precision.
 
@@ -93,7 +95,7 @@ Five tables in a `raw` schema, all data tables range-partitioned by `block_numbe
 
 ### 6. Write Buffer
 
-**Approach:** Configurable batch accumulator (`FLUSH_SIZE`, `FLUSH_INTERVAL_MS`) that buffers N blocks before flushing to PostgreSQL in a single transaction. Reduces PG round-trips by `flushSize×`. Promise-chain serialization prevents concurrent flush races. On flush failure, the promise chain resets (subsequent flushes are not permanently blocked) and the batch is restored to the buffer for retry (no data loss from the buffer layer).
+**Approach:** Configurable batch accumulator (`FLUSH_SIZE`, `FLUSH_INTERVAL_MS`) that buffers N blocks before flushing to PostgreSQL in a single transaction. Reduces PG round-trips by `flushSize×`. Promise-chain serialization prevents concurrent flush races. On flush failure, the promise chain resets (subsequent flushes are not permanently blocked) and the batch is restored to the buffer for retry.
 
 **Data safety:** Buffer is flushed before marking any task complete in Redis. On drain (SIGTERM), buffer is flushed before requeuing. On shutdown, `main.ts` performs a final flush before closing connections.
 
@@ -151,11 +153,11 @@ LOG_LEVEL=debug npm start
 | Worker crashes mid-task | Task stays in `processing` list, reclaimed after 2 min by any surviving worker via pipelined heartbeat checks |
 | Worker crashes mid-block | PG transaction rolls back (no partial data). Block is re-processed on reclaim. Idempotent inserts handle duplicates |
 | RPC returns 429 | Shared rate limiter cuts effective rate 25% across all workers (via Redis Lua). RPC client retries with exponential backoff |
-| RPC endpoint goes down | Circuit breaker opens after 60% failure rate in 20-call window. RPC pool fails over to next endpoint if available |
+| RPC endpoint goes down | Circuit breaker opens after 60% failure rate in 20-call ring buffer window. RPC pool fails over to next endpoint if available |
 | Redis goes down | Workers crash (by design — Redis is the coordination backbone). On Redis restart, persisted data survives (AOF). PG watermark enables recovery |
 | PostgreSQL goes down | Insert fails, task is requeued. Idempotent inserts handle re-processing when PG recovers |
 | Duplicate blocks | `ON CONFLICT DO NOTHING` on all tables — safe to re-process any block |
-| Block reorgs | Using `finalized` block tag avoids reorgs entirely. `parentHash` chain check halts the task on discontinuity (requeued for retry via different RPC endpoint). **Known gap:** parentHash is only verified within a task — cross-task boundary verification requires storing last block hash per chain in Redis (see ARCHITECTURE.md Expert Board BUG 2) |
+| Block reorgs | Using `finalized` block tag avoids reorgs entirely. `parentHash` chain check halts the task on discontinuity (requeued for retry via different RPC endpoint). Cross-task boundary verification uses block hash storage in Redis |
 | Poison block (always fails) | Dead-letter queue after 5 retries — task moved to `queue:dead` instead of infinite requeue |
 | Slow shutdown | 25-second deadline timer forces exit before k8s SIGKILL (30s default grace period) |
 | Write buffer data loss | Buffer flushed before task completion, before drain, and before shutdown. On flush failure, batch is restored to buffer for retry. Promise chain resets after error (no permanent stall). Only PG-confirmed blocks are marked in Redis |
@@ -164,7 +166,7 @@ LOG_LEVEL=debug npm start
 
 **Reorg handling:** Index at `latest` with a configurable confirmation depth (`CONFIRMATION_DEPTH=64`). Store the last N block hashes in `indexer_state` and detect `parentHash` breaks across task boundaries, not just within tasks. On reorg detection, `DELETE` orphaned blocks from PG and re-index from the fork point.
 
-**Storage tiering:** Hot data in PostgreSQL (recent partitions), cold data exported to Parquet on S3 via a `TieringManager`. Detach and drop PG partitions after successful S3 upload. At 120 chains × years of history, this bounds PG disk usage.
+**Storage tiering:** Hot data in PostgreSQL (recent partitions), cold data exported to Parquet on S3 via a `TieringManager`. Detach and drop PG partitions after successful S3 upload. At 120 chains x years of history, this bounds PG disk usage.
 
 **COPY protocol:** For historical backfill, replace multi-row INSERT with `COPY FROM STDIN` via staging tables + upsert. 3-10x faster for bulk immutable data.
 
@@ -174,17 +176,17 @@ LOG_LEVEL=debug npm start
 
 ## Scale Considerations
 
-Table partitioning by `block_number` range (1M blocks per partition) — partitions pre-created up to `END_BLOCK` during migration to avoid DDL lock storms at runtime. Read replicas to separate indexing write load from API query load. BRIN indexes on timestamp columns (physically ordered data, ~100x smaller than B-tree). B-tree on `topic0` for ERC-20 Transfer filtering (the dominant query pattern) instead of GIN on full JSONB (highest write amplification in PG). Connection pooling via PgBouncer for 120-chain deployments where `PG_POOL_MAX × chain_count` would exceed PG `max_connections`.
+Table partitioning by `block_number` range (1M blocks per partition) — partitions pre-created up to `END_BLOCK` during migration to avoid DDL lock storms at runtime. Read replicas to separate indexing write load from API query load. BRIN indexes on timestamp columns (physically ordered data, ~100x smaller than B-tree). B-tree on `topic0` for ERC-20 Transfer filtering (the dominant query pattern) instead of GIN on full JSONB (highest write amplification in PG). Connection pooling via PgBouncer for 120-chain deployments where `PG_POOL_MAX x chain_count` would exceed PG `max_connections`.
 
 ## Token Terminal Context
 
 This indexer represents the "ingestion" layer — analogous to TT's Go-based chain indexers that feed raw blockchain data into the pipeline. In the full pipeline:
 
 ```
-Ingestion (this)  →  ETL (dbt)  →  OLAP (ClickHouse)  →  Warehouse (BigQuery)
+Ingestion (this)  ->  ETL (dbt)  ->  OLAP (ClickHouse)  ->  Warehouse (BigQuery)
     PG (OLTP)          Transform       Sub-second queries     Historical analytics
 ```
 
-At 120 chains, each chain would run as a separate indexer instance with chain-specific config (RPC endpoints, block times, finality rules). The `indexer_state.high_water_mark` table provides the checkpoint that downstream CDC (Change Data Capture) or periodic ETL jobs use to replicate incremental data from PG into ClickHouse.
+At 120 chains, each chain runs as a separate indexer instance with chain-specific config (RPC endpoints, block times, finality rules). The `indexer_state.high_water_mark` table provides the checkpoint that downstream CDC (Change Data Capture) or periodic ETL jobs use to replicate incremental data from PG into ClickHouse.
 
 The patterns implemented here — idempotent inserts, distributed rate limiting, Redis work queues, circuit breakers, adaptive backpressure, dead-letter queues — translate directly to TT's scale where reliability across 120 chains matters more than raw speed on any single one.

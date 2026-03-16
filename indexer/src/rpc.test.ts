@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { RpcClient } from "./rpc.js";
+import { RpcClient, JsonRpcError, isMethodNotSupported } from "./rpc.js";
 import type { RateLimiter } from "./rate-limiter.js";
 
 // Stub rate limiter — always allows
@@ -161,5 +161,192 @@ describe("RpcClient", () => {
 
     const rpc = new RpcClient("http://test", stubLimiter, 0);
     await expect(rpc.getBlockNumber()).rejects.toThrow("Invalid Request");
+  });
+
+  it("throws JsonRpcError with code on JSON-RPC error", async () => {
+    mockFetch([
+      {
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          error: { code: -32601, message: "Method not found" },
+        },
+      },
+    ]);
+
+    const rpc = new RpcClient("http://test", stubLimiter, 0);
+    await expect(rpc.getBlockNumber()).rejects.toSatisfy((err: unknown) => {
+      return err instanceof JsonRpcError && err.code === -32601;
+    });
+  });
+
+  it("getFinalizedBlockNumber throws JsonRpcError -32601 when method not supported", async () => {
+    mockFetch([
+      {
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          error: { code: -32601, message: "The method eth_getBlockByNumber does not exist" },
+        },
+      },
+    ]);
+
+    const rpc = new RpcClient("http://test", stubLimiter, 0);
+    try {
+      await rpc.getFinalizedBlockNumber();
+      expect.unreachable("should have thrown");
+    } catch (err) {
+      expect(isMethodNotSupported(err)).toBe(true);
+    }
+  });
+
+  it("getFinalizedBlockNumber does NOT match isMethodNotSupported for other RPC errors", async () => {
+    mockFetch([
+      {
+        status: 200,
+        body: {
+          jsonrpc: "2.0",
+          id: 1,
+          error: { code: -32000, message: "Server error" },
+        },
+      },
+    ]);
+
+    const rpc = new RpcClient("http://test", stubLimiter, 0);
+    try {
+      await rpc.getFinalizedBlockNumber();
+      expect.unreachable("should have thrown");
+    } catch (err) {
+      expect(isMethodNotSupported(err)).toBe(false);
+      expect(err).toBeInstanceOf(JsonRpcError);
+      expect((err as JsonRpcError).code).toBe(-32000);
+    }
+  });
+
+  it("throws JsonRpcError with code from batch calls (non-receipt errors)", async () => {
+    mockFetch([
+      {
+        status: 200,
+        body: [
+          { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "Server error" } },
+          { jsonrpc: "2.0", id: 2, result: [] },
+        ],
+      },
+    ]);
+
+    const rpc = new RpcClient("http://test", stubLimiter, 0);
+    await expect(rpc.getBlockWithReceipts(10)).rejects.toSatisfy((err: unknown) => {
+      return err instanceof JsonRpcError && err.code === -32000;
+    });
+  });
+
+  it("falls back to per-tx receipts when eth_getBlockReceipts returns -32601", async () => {
+    const blockData = {
+      number: "0xa",
+      hash: "0xabc",
+      parentHash: "0xdef",
+      timestamp: "0x60",
+      gasUsed: "0x100",
+      gasLimit: "0x200",
+      transactions: [
+        { hash: "0xtx1", blockNumber: "0xa", transactionIndex: "0x0", from: "0x1", to: "0x2", value: "0x0", gas: "0x0", input: "0x", nonce: "0x0" },
+      ],
+    };
+    const receiptData = {
+      transactionHash: "0xtx1",
+      status: "0x1",
+      cumulativeGasUsed: "0x100",
+      gasUsed: "0x50",
+      contractAddress: null,
+      logs: [],
+    };
+
+    mockFetch([
+      // First call: batch [eth_getBlockByNumber, eth_getBlockReceipts] — receipts returns -32601
+      {
+        status: 200,
+        body: [
+          { jsonrpc: "2.0", id: 1, result: blockData },
+          { jsonrpc: "2.0", id: 2, error: { code: -32601, message: "Method not found" } },
+        ],
+      },
+      // Second call: fallback eth_getBlockByNumber (single)
+      { status: 200, body: { jsonrpc: "2.0", id: 3, result: blockData } },
+      // Third call: batch [eth_getTransactionReceipt] per tx
+      {
+        status: 200,
+        body: [
+          { jsonrpc: "2.0", id: 4, result: receiptData },
+        ],
+      },
+    ]);
+
+    const rpc = new RpcClient("http://test", stubLimiter, 0);
+    const { block, receipts } = await rpc.getBlockWithReceipts(10);
+
+    expect(block.hash).toBe("0xabc");
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.transactionHash).toBe("0xtx1");
+  });
+
+  it("caches the fallback flag — second call skips eth_getBlockReceipts", async () => {
+    const blockData = {
+      number: "0xa",
+      hash: "0xabc",
+      parentHash: "0xdef",
+      timestamp: "0x60",
+      gasUsed: "0x100",
+      gasLimit: "0x200",
+      transactions: [],
+    };
+
+    mockFetch([
+      // First getBlockWithReceipts: batch fails with -32601
+      {
+        status: 200,
+        body: [
+          { jsonrpc: "2.0", id: 1, result: blockData },
+          { jsonrpc: "2.0", id: 2, error: { code: -32601, message: "Method not found" } },
+        ],
+      },
+      // Fallback: individual eth_getBlockByNumber
+      { status: 200, body: { jsonrpc: "2.0", id: 3, result: blockData } },
+      // Second getBlockWithReceipts: goes straight to fallback (no batch attempt)
+      { status: 200, body: { jsonrpc: "2.0", id: 4, result: blockData } },
+    ]);
+
+    const rpc = new RpcClient("http://test", stubLimiter, 0);
+
+    // First call triggers fallback
+    await rpc.getBlockWithReceipts(10);
+    // Second call should use cached flag — no batch call, just individual fetch
+    const { block } = await rpc.getBlockWithReceipts(11);
+    expect(block.hash).toBe("0xabc");
+
+    // 3 fetch calls total: batch (failed), fallback block, second fallback block
+    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("isMethodNotSupported", () => {
+  it("returns true for JsonRpcError with code -32601", () => {
+    expect(isMethodNotSupported(new JsonRpcError(-32601, "Method not found"))).toBe(true);
+  });
+
+  it("returns false for JsonRpcError with different code", () => {
+    expect(isMethodNotSupported(new JsonRpcError(-32600, "Invalid Request"))).toBe(false);
+    expect(isMethodNotSupported(new JsonRpcError(-32000, "Server error"))).toBe(false);
+  });
+
+  it("returns false for plain Error", () => {
+    expect(isMethodNotSupported(new Error("network timeout"))).toBe(false);
+  });
+
+  it("returns false for non-error values", () => {
+    expect(isMethodNotSupported(null)).toBe(false);
+    expect(isMethodNotSupported(undefined)).toBe(false);
+    expect(isMethodNotSupported("string error")).toBe(false);
   });
 });

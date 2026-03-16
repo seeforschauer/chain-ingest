@@ -125,7 +125,15 @@ export class Worker {
       blocks: endBlock - startBlock + 1,
     });
 
-    this.lastBlockHash = null;
+    // Cross-task chain integrity: load stored hash from Redis for the block
+    // preceding this task's range. If startBlock > 0, the previous task should
+    // have stored its last block's hash. This closes the gap where lastBlockHash
+    // was reset to null at every task boundary, silently accepting reorgs.
+    if (startBlock > 0) {
+      this.lastBlockHash = await this.coordinator.getLastBlockHash(startBlock - 1);
+    } else {
+      this.lastBlockHash = null;
+    }
     let lastFlushedBlock = startBlock - 1;
 
     try {
@@ -149,7 +157,9 @@ export class Worker {
           if (blockNum > startBlock) {
             await this.coordinator.markBlocksCompleted(startBlock, blockNum - 1);
           }
-          await this.coordinator.requeueTask(task);
+          // Drain split is not a failure — reset retryCount so the remainder
+          // doesn't inherit accumulated retries from the original task.
+          await this.coordinator.requeueTask({ ...task, retryCount: 0 });
 
           this.running = false;
           return;
@@ -170,11 +180,20 @@ export class Worker {
       await this.writeBuffer?.flush();
       lastFlushedBlock = endBlock;
       await this.coordinator.completeTask(task);
-      await this.storage.updateWatermark(this.chainId, endBlock, this.workerId);
 
-      // Evict completed entries below watermark to bound Redis memory growth
-      const watermark = await this.storage.getWatermark(this.chainId);
-      await this.coordinator.evictCompletedBelow(watermark);
+      // Compute contiguous watermark — scan from current PG watermark upward,
+      // stop at the first gap. This prevents the watermark from jumping past
+      // unprocessed blocks when tasks complete out of order.
+      const currentWatermark = await this.storage.getWatermark(this.chainId);
+      const contiguousWatermark = await this.coordinator.getContiguousWatermark(currentWatermark);
+      if (contiguousWatermark >= currentWatermark) {
+        await this.storage.updateWatermark(this.chainId, contiguousWatermark, this.workerId);
+      }
+
+      // Evict completed entries below watermark to bound Redis memory growth.
+      // Use the known value — no need to re-read from PG.
+      const safeEvictPoint = contiguousWatermark >= currentWatermark ? contiguousWatermark : currentWatermark;
+      await this.coordinator.evictCompletedBelow(safeEvictPoint);
 
       // Throttle stats — getStats() is 3 Redis calls per invocation
       const now = Date.now();
@@ -245,6 +264,11 @@ export class Worker {
       );
     }
     this.lastBlockHash = block.hash;
+
+    // Persist block hash to Redis for cross-task chain integrity verification.
+    // The next task starting at blockNumber+1 will read this hash and verify
+    // its first block's parentHash matches — closing the cross-task gap.
+    await this.coordinator.setLastBlockHash(blockNumber, block.hash);
 
     const storageStart = Date.now();
     if (this.writeBuffer) {

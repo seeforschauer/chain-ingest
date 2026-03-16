@@ -1,12 +1,12 @@
 // Work distribution and progress tracking via Redis.
 //
 // Block ranges are pushed to a Redis list as JSON tasks.
-// Workers atomically claim tasks with BRPOPLPUSH (pending → processing).
+// Workers atomically claim tasks with BLMOVE (pending → processing).
 // Completed blocks are tracked in a sorted set for gap detection.
 // Crashed workers' tasks are reclaimed via heartbeat expiry.
 //
 // Redis Streams would be ideal at TT's 120-chain scale, but
-// BRPOPLPUSH gives atomic claiming with simpler semantics for this scope.
+// BLMOVE gives atomic claiming with simpler semantics for this scope.
 
 import type Redis from "ioredis";
 import { log } from "./logger.js";
@@ -31,6 +31,7 @@ export class Coordinator {
   private readonly TASK_META: string;
   private readonly INIT_LOCK: string;
   private readonly HEARTBEAT_PREFIX: string;
+  private readonly BLOCK_HASH: string;
 
   constructor(
     private readonly redis: Redis,
@@ -45,6 +46,13 @@ export class Coordinator {
     this.TASK_META = `${p}:task_meta`;
     this.INIT_LOCK = `${p}:init_lock`;
     this.HEARTBEAT_PREFIX = `${p}:heartbeat:`;
+    this.BLOCK_HASH = `${p}:block_hash`;
+  }
+
+  /** Redis server time in milliseconds. Immune to worker clock drift. */
+  private async getRedisTimeMs(): Promise<number> {
+    const [seconds, microseconds] = await this.redis.time();
+    return Number(seconds) * 1000 + Math.floor(Number(microseconds) / 1000);
   }
 
   async initQueue(
@@ -119,9 +127,11 @@ export class Coordinator {
     workerId: string,
     timeoutSec: number = 5
   ): Promise<BlockTask | null> {
-    const raw = await this.redis.brpoplpush(
+    const raw = await this.redis.blmove(
       this.QUEUE_PENDING,
       this.QUEUE_PROCESSING,
+      "RIGHT",
+      "LEFT",
       timeoutSec
     );
 
@@ -129,7 +139,7 @@ export class Coordinator {
 
     const task: BlockTask = JSON.parse(raw);
     task.assignedTo = workerId;
-    task.assignedAt = Date.now();
+    task.assignedAt = await this.getRedisTimeMs();
 
     // Metadata stored in separate hash — never mutate the queue entry,
     // so lrem always matches the original JSON string.
@@ -142,7 +152,7 @@ export class Coordinator {
     );
     setup.set(
       `${this.HEARTBEAT_PREFIX}${workerId}`,
-      Date.now().toString(),
+      task.assignedAt.toString(),
       "EX",
       HEARTBEAT_TTL_SEC
     );
@@ -170,6 +180,10 @@ export class Coordinator {
     const retryCount = (task.retryCount ?? 0) + 1;
     const cleanOriginal: BlockTask = { startBlock: task.startBlock, endBlock: task.endBlock };
     const originalRaw = JSON.stringify(cleanOriginal);
+    const taskKey = `${task.startBlock}:${task.endBlock}`;
+
+    // Single pipeline per branch — no crash window between queue move and cleanup
+    const pipe = this.redis.pipeline();
 
     if (retryCount > MAX_TASK_RETRIES) {
       log("error", "Task exceeded max retries — moving to dead-letter queue", {
@@ -177,24 +191,24 @@ export class Coordinator {
         endBlock: task.endBlock,
         retryCount,
       });
-      await this.redis.rpush(this.QUEUE_DEAD, JSON.stringify({ ...cleanOriginal, retryCount }));
+      pipe.rpush(this.QUEUE_DEAD, JSON.stringify({ ...cleanOriginal, retryCount }));
     } else {
-      // lpush: requeued tasks go to the back of the claim order (brpoplpush pops from right)
+      // lpush: requeued tasks go to the back of the claim order (blmove pops from right)
       // Prevents failing blocks from starving forward progress on healthy blocks
       const requeued: BlockTask = { ...cleanOriginal, retryCount };
-      await this.redis.lpush(this.QUEUE_PENDING, JSON.stringify(requeued));
+      pipe.lpush(this.QUEUE_PENDING, JSON.stringify(requeued));
     }
 
-    const cleanup = this.redis.pipeline();
-    cleanup.lrem(this.QUEUE_PROCESSING, 1, originalRaw);
-    cleanup.hdel(this.TASK_META, `${task.startBlock}:${task.endBlock}`);
-    await cleanup.exec();
+    pipe.lrem(this.QUEUE_PROCESSING, 1, originalRaw);
+    pipe.hdel(this.TASK_META, taskKey);
+    await pipe.exec();
   }
 
   async updateHeartbeat(workerId: string): Promise<void> {
+    const now = await this.getRedisTimeMs();
     await this.redis.set(
       `${this.HEARTBEAT_PREFIX}${workerId}`,
-      Date.now().toString(),
+      now.toString(),
       "EX",
       HEARTBEAT_TTL_SEC
     );
@@ -214,7 +228,7 @@ export class Coordinator {
     const processing = await this.redis.lrange(this.QUEUE_PROCESSING, 0, -1);
     if (processing.length === 0) return 0;
 
-    const now = Date.now();
+    const now = await this.getRedisTimeMs();
 
     // Pipeline avoids N sequential round-trips per processing entry
     const entries: Array<{ raw: string; task: BlockTask; taskKey: string }> = [];
@@ -321,6 +335,39 @@ export class Coordinator {
       0,
       watermark - 1
     );
+
+    // Sweep BLOCK_HASH entries below watermark — without this, the hash grows
+    // unbounded (20M blocks × 120 chains = OOM). HSCAN in chunks to avoid
+    // blocking Redis with a single huge HDEL.
+    const SCAN_BATCH = 1000;
+    let cursor = "0";
+    do {
+      const [nextCursor, fields] = await this.redis.hscan(
+        this.BLOCK_HASH,
+        cursor,
+        "COUNT",
+        SCAN_BATCH
+      );
+      cursor = nextCursor;
+
+      // hscan returns [field, value, field, value, ...]
+      const toDelete: string[] = [];
+      for (let i = 0; i < fields.length; i += 2) {
+        const blockNum = Number(fields[i]);
+        if (blockNum < watermark) {
+          toDelete.push(fields[i]!);
+        }
+      }
+
+      if (toDelete.length > 0) {
+        const delPipe = this.redis.pipeline();
+        for (const field of toDelete) {
+          delPipe.hdel(this.BLOCK_HASH, field);
+        }
+        await delPipe.exec();
+      }
+    } while (cursor !== "0");
+
     if (removed > 0) {
       log("debug", "Evicted completed blocks below watermark", {
         watermark,
@@ -371,5 +418,64 @@ export class Coordinator {
       toBlock
     );
     return new Set(members.map(Number));
+  }
+
+  /** Get stored hash for a block — used for cross-task chain integrity verification. */
+  async getLastBlockHash(blockNumber: number): Promise<string | null> {
+    return this.redis.hget(this.BLOCK_HASH, blockNumber.toString());
+  }
+
+  /** Store block hash — enables cross-task parentHash verification. */
+  async setLastBlockHash(blockNumber: number, hash: string): Promise<void> {
+    await this.redis.hset(this.BLOCK_HASH, blockNumber.toString(), hash);
+  }
+
+  /**
+   * Compute contiguous watermark — scan the completed sorted set from
+   * currentWatermark upward, stop at the first gap.
+   *
+   * Returns the highest block N where all blocks currentWatermark..N
+   * are present in the completed set. If the block at currentWatermark
+   * itself is not completed, returns currentWatermark - 1 (no advance).
+   *
+   * This prevents the watermark from jumping past gaps when tasks
+   * complete out of order.
+   */
+  async getContiguousWatermark(currentWatermark: number): Promise<number> {
+    // Fetch completed blocks from currentWatermark onward in chunks.
+    // We use a reasonable page size to avoid loading the entire set.
+    const PAGE_SIZE = 10_000;
+    let scanFrom = currentWatermark;
+    let contiguous = currentWatermark - 1;
+
+    while (true) {
+      const scanTo = scanFrom + PAGE_SIZE - 1;
+      const members = await this.redis.zrangebyscore(
+        this.COMPLETED_SET,
+        scanFrom,
+        scanTo
+      );
+
+      if (members.length === 0) break;
+
+      const blocks = members.map(Number).sort((a, b) => a - b);
+
+      for (const block of blocks) {
+        if (block === contiguous + 1) {
+          contiguous = block;
+        } else {
+          // Gap found — stop here
+          return contiguous;
+        }
+      }
+
+      // If we got fewer members than the page size, no more to scan
+      if (members.length < PAGE_SIZE) break;
+
+      // Continue scanning from where we left off
+      scanFrom = contiguous + 1;
+    }
+
+    return contiguous;
   }
 }

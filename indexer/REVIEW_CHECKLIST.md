@@ -1,6 +1,6 @@
 # Code Review Checklist — Distributed Systems
 
-Extracted from 9 review rounds on this indexer. Applicable to any distributed data pipeline.
+Applicable to any distributed data pipeline. 32 design decisions documented in ARCHITECTURE.md; this checklist covers the review methodology.
 
 ## 1. Operation Ordering in Distributed State
 
@@ -13,7 +13,6 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 ## 2. Resource Isolation (Multi-Tenant Keys)
 
 - [ ] **Scope ALL shared-resource keys**: If Redis keys are scoped per tenant/chain, verify that EVERY key follows the convention — not just the obvious ones. A single global key in a sea of scoped keys breaks isolation silently.
-  - Caught: `indexer:rate_limit` was global while all coordinator keys were `indexer:{chainId}:*`
 - [ ] **Grep for hardcoded key prefixes**: After adding scoping, search for any remaining bare `"indexer:"` literals that lack the scope variable.
 
 ## 3. Strict Input Parsing
@@ -25,15 +24,13 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 
 - [ ] **Know your resource ceilings**: PostgreSQL max 65,535 parameters per query. Redis pipelines buffer all commands in Node.js memory before sending. Both will blow up on large inputs.
   - PG: Arbitrum 10K txs * 10 params = 100K — exceeds limit, worker stalls permanently. Fix: chunk at 5,000 rows.
-  - Redis: 20M blocks / batch 10 = 2M pipeline commands ≈ 500MB RAM. BSC (45M blocks) = OOM. Fix: chunk at 10,000 commands per pipeline.
+  - Redis: 20M blocks / batch 10 = 2M pipeline commands ~ 500MB RAM. BSC (45M blocks) = OOM. Fix: chunk at 10,000 commands per pipeline.
 - [ ] **Apply the fix at every layer**: If you chunk PG inserts, also chunk Redis pipelines. Same bug class, same fix. Audit every `pipeline()` and every multi-row INSERT for unbounded loops.
-- [ ] **Chunk by OUTPUT row count, not INPUT row count**: When parent and child tables have 1:N relationships (transactions → logs), chunking by parent count doesn't bound child count. A chunk of 5,000 txs can produce 50,000 logs on DeFi-heavy chains (Uniswap swaps emit 5-10 logs). Logs must be chunked independently.
-  - Caught: `batchInsertLogs` chunked by transaction count (5000 txs × ~5 logs × 6 params = 150K) — exceeded PG limit on Polygon/Arbitrum.
+- [ ] **Chunk by OUTPUT row count, not INPUT row count**: When parent and child tables have 1:N relationships (transactions -> logs), chunking by parent count doesn't bound child count. A chunk of 5,000 txs can produce 50,000 logs on DeFi-heavy chains (Uniswap swaps emit 5-10 logs). Logs must be chunked independently.
 
 ## 5. Batch/RPC Response Validation
 
 - [ ] **Filter and validate batch responses**: JSON-RPC batch responses may contain null entries, missing IDs, or fewer items than requested. Always filter, validate count, then sort — never assume response order or completeness.
-  - Without filter: `null.id` comparison in sort produces NaN, silently reorders responses — block data and receipts can swap.
 
 ## 6. Null Guards on External Data
 
@@ -42,16 +39,11 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 ## 7. Hot-Path Performance
 
 - [ ] **Pipeline Redis calls in loops**: Sequential `await redis.command()` inside a loop is O(N) round-trips. Pipeline all calls, execute once, iterate results. This is the single biggest perf win for Redis-heavy code.
-  - `initQueue`: 2M sequential zcounts for 20M blocks → 1 pipelined round-trip
 - [ ] **Throttle periodic maintenance**: Operations like `reclaimStaleTasks` and `getStats` don't need to run every loop iteration. Time-gate them (e.g., every 30s) to avoid per-iteration Redis overhead.
 - [ ] **Cache immutable lookups in memory**: If the answer doesn't change (e.g., partition existence after CREATE TABLE), cache it in a `Set` or `Map`. Don't query the database on every iteration to re-confirm what you already know.
-  - `ensurePartition`: pg_class query on every block → `knownPartitions` Set reduces 20M queries to ~20
 - [ ] **Batch range queries instead of per-item lookups**: When checking multiple items against the same data source, fetch the full range once and check locally.
-  - `isBlockCompleted`: N per-block ZSCORE calls → single ZRANGEBYSCORE + Set.has()
-- [ ] **Share expensive fetches across multiple consumers**: If two code paths in the same scope both need the same data, fetch once and pass the result to both. Don't call the same function twice because the code was written in separate blocks.
-  - Worker idle loop: stats logging and completion check both called `getStats()` independently — combined into single fetch
-- [ ] **Mark partial progress on failure**: When a task partially completes (blocks 0-5 succeed, block 6 fails), mark progress before requeueing. Without this, the next worker re-processes all blocks from scratch (PG idempotent, but wastes RPC calls). At 45 PB/day, redundant RPC is the bottleneck.
-  - Worker `processTask`: `markBlocksCompleted(startBlock, lastProcessedBlock)` in the catch block
+- [ ] **Share expensive fetches across multiple consumers**: If two code paths in the same scope both need the same data, fetch once and pass the result to both.
+- [ ] **Mark partial progress on failure**: When a task partially completes (blocks 0-5 succeed, block 6 fails), mark progress before requeueing. Without this, the next worker re-processes all blocks from scratch (PG idempotent, but wastes RPC calls).
 
 ## 8. Chain Continuity / Data Integrity
 
@@ -65,7 +57,7 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 
 ## 10. Schema Design at Scale
 
-- [ ] **Partition ALL data tables by range**: Every data table must be partitioned — not just blocks and logs. An unpartitioned transactions or receipts table grows without bound: can't drop old partitions, B-tree indexes bloat, range queries degrade. Caught: `raw.transactions` and `raw.receipts` were unpartitioned while `raw.blocks` and `raw.logs` were.
+- [ ] **Partition ALL data tables by range**: Every data table must be partitioned — not just blocks and logs. An unpartitioned transactions or receipts table grows without bound: can't drop old partitions, B-tree indexes bloat, range queries degrade.
 - [ ] **Include partition key in all related tables**: Receipts need `block_number` even though it's "redundant" with the transaction. Without it, receipts can't be co-partitioned, can't be range-pruned, and are orphaned from the physical layout.
 - [ ] **PK must include partition key**: PostgreSQL requires the partition key in PRIMARY KEY on partitioned tables. Use `(block_number, tx_hash)` not just `(tx_hash)`. Update `ON CONFLICT` clauses to match.
 - [ ] **Drop foreign keys on partitioned tables**: FKs add write overhead and complicate partition management. When data is always inserted atomically in one transaction, referential integrity is guaranteed by the application.
@@ -91,7 +83,7 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 
 ## 14. Connection Lifecycle
 
-- [ ] **Graceful disconnect — send QUIT before TCP close**: `redis.quit()` sends QUIT and waits for acknowledgment. `redis.disconnect()` drops TCP without handshake. At 120 chains × N workers, ungraceful disconnects leak server-side connection state and can exhaust Redis's connection tracking.
+- [ ] **Graceful disconnect — send QUIT before TCP close**: `redis.quit()` sends QUIT and waits for acknowledgment. `redis.disconnect()` drops TCP without handshake. At 120 chains x N workers, ungraceful disconnects leak server-side connection state and can exhaust Redis's connection tracking.
 - [ ] **Pipeline independent Redis calls at every callsite**: If two Redis commands are independent of each other (e.g., `lrem` + `hdel` cleanup, or `hset` + `set` post-claim setup), pipeline them into a single round-trip. Audit every method for sequential `await redis.x(); await redis.y()` where neither depends on the other's result.
 
 ## 15. Test Coverage Patterns
@@ -102,12 +94,50 @@ Extracted from 9 review rounds on this indexer. Applicable to any distributed da
 
 ## 16. Systematic Bug-Class Auditing
 
-- [ ] **After fixing any bug, grep for the same pattern across the entire codebase**: The write-before-delete bug appeared in 4 callsites. Fixing it in one place while missing three others is worse than not fixing it at all — it shows you understood the problem but didn't apply it systematically.
-  - Method: `grep lrem` (or whatever the operation is) → audit every callsite
-  - This took multiple review rounds to fully catch. One `grep` after the first fix would have found all 4 in one pass.
+- [ ] **After fixing any bug, grep for the same pattern across the entire codebase**: The write-before-delete bug can appear in multiple callsites. Fixing it in one place while missing three others is worse than not fixing it at all — it shows you understood the problem but didn't apply it systematically.
+  - Method: `grep lrem` (or whatever the operation is) -> audit every callsite
 - [ ] **Same principle for scoping/isolation**: After scoping one Redis key by chainId, grep for all remaining bare key literals.
-- [ ] **Same principle for strict parsing**: After fixing `parseInt` → `Number()` in one parser, audit every other `parseInt` in config.
+- [ ] **Same principle for strict parsing**: After fixing `parseInt` -> `Number()` in one parser, audit every other `parseInt` in config.
 
----
+## 17. Shared State in Multi-Worker Systems
 
-*Extracted from multiple self-review rounds. Each item caught a real bug or prevented a production incident.*
+- [ ] **Local counters diverge under concurrency**: If a counter controls shared behavior (rate recovery, circuit breaker state), it must live in the shared store (Redis), not per-worker memory. N workers with local counters = N independent views of the same system.
+- [ ] **Read shared state inside atomic scripts**: Don't pass cached local values as arguments to Lua scripts. Read from Redis inside the script: `redis.call('GET', key)`. One extra GET per call, but all workers agree on the same value.
+- [ ] **Use redis.time() for timestamps, not Date.now()**: Workers on different machines have skewed clocks. Redis's monotonic clock is the single source of truth for stale detection, heartbeats, and rate-limit windows.
+
+## 18. Unbounded Redis Memory
+
+- [ ] **Every Redis structure must have an eviction path**: Sorted sets, hashes, and lists that grow with data volume will OOM Redis. For each structure: what triggers eviction? Is eviction paired with the data lifecycle?
+- [ ] **Hash eviction via HSCAN+HDEL**: When evicting a sorted set (ZREMRANGEBYSCORE), also evict any associated hash entries in the same watermark range. Forgetting one half creates asymmetric growth.
+- [ ] **Redis Cluster compatibility**: Multi-key Lua scripts require all keys to hash to the same slot. Use hash tags: `indexer:{chainId}:*` where `{chainId}` is the tag.
+
+## 19. Database Schema Decisions at Scale
+
+- [ ] **Natural composite PK over synthetic BIGSERIAL**: If the data has a natural unique key (block_number + tx_hash + log_index), use it as PK. BIGSERIAL adds: sequence contention, non-deterministic IDs on re-index, and double index maintenance.
+- [ ] **Composite indexes for dominant query patterns**: If 90% of queries filter on (A, B), a composite index `(A, B)` is one scan instead of bitmap merge on two single-column indexes.
+- [ ] **Don't index what partitioning already handles**: BRIN on the partition key inside a range-partitioned table is redundant — partition pruning already restricts the scan. Save the write amplification.
+- [ ] **Filter pg_class by schema**: `SELECT FROM pg_class WHERE relname = ...` without a pg_namespace join matches tables in ANY schema. In multi-schema deployments, this silently skips partition creation.
+- [ ] **escapeIdentifier on all DDL**: Table names interpolated into DDL strings are injection vectors. Use `escapeIdentifier` from pg, even if current inputs are controlled — it costs nothing and prevents future regressions.
+
+## 20. RPC Resilience
+
+- [ ] **Receipt method fallback**: `eth_getBlockReceipts` is non-standard. When it returns -32601, fall back to per-tx `eth_getTransactionReceipt`. Cache the capability flag per client — probe once, not per block.
+- [ ] **Chunk large RPC batches**: L2 blocks can have 1000+ transactions. Per-tx receipt fallback must chunk (e.g., 100/batch) to stay within provider limits.
+- [ ] **Explicit finality fallback**: Only catch -32601 for method-not-found. All other errors (timeout, 500) must fail loudly — a silent fallback from `finalized` to `latest` permanently degrades data guarantees.
+- [ ] **Redact credentials in logs**: RPC URLs often contain API keys in the path. Log `new URL(url).host` only.
+
+## 21. O(1) Hot-Path Data Structures
+
+- [ ] **Ring buffer over array for sliding windows**: `Array.shift()` is O(n), `Array.filter()` allocates. A fixed-size ring buffer with head pointer and incremental counter is O(1) for both insert and query. At 6000+ RPC calls/sec across 120 chains, this matters.
+- [ ] **Rate recovery must make progress at floor**: `math.floor(1 * 1.10) = 1` — recovery stuck forever. Use `math.max(current + 1, math.ceil(current * increase))` to guarantee at least +1 per recovery cycle.
+
+## 22. Docker & DevOps
+
+- [ ] **Healthchecks must use tools available in the image**: Minimal images (Alpine, distroless, Foundry) don't have `curl`. Use image-native tools (`cast` for Foundry, `pg_isready` for Postgres, `redis-cli ping` for Redis).
+- [ ] **Env vars in healthchecks**: `pg_isready -U ${POSTGRES_USER:-indexer}`, not hardcoded `pg_isready -U indexer`.
+
+## 23. Documentation as Present State
+
+- [ ] **Describe what the code DOES, not what was fixed**: Readers care about current behavior. "The watermark tracks contiguous completeness" — not "BUG 1 was found and fixed."
+- [ ] **Every design decision gets a "Why?"**: If you made a choice, document the alternative you rejected and why. 32 is better than 10 — thoroughness signals depth.
+- [ ] **Self-review culture**: Score your own work honestly. Document what breaks at scale. The delta between current state and production-ready is more valuable than claiming everything is perfect.

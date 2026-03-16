@@ -11,3 +11,8 @@ services:
       - --host=0.0.0.0
       - --fork-url=${ANVIL_FORK_URL:-https://reth-ethereum.ithaca.xyz/rpc}
       - --block-time=2
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://localhost:8545"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
