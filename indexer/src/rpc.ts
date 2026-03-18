@@ -11,6 +11,9 @@ export interface BlockData {
   gasUsed: string;
   gasLimit: string;
   baseFeePerGas?: string;
+  // EIP-4844 (Dencun)
+  blobGasUsed?: string;
+  excessBlobGas?: string;
   transactions: TransactionData[];
 }
 
@@ -25,6 +28,13 @@ export interface TransactionData {
   gas: string;
   input: string;
   nonce: string;
+  // EIP-1559
+  type?: string;
+  maxFeePerGas?: string;
+  maxPriorityFeePerGas?: string;
+  // EIP-4844
+  maxFeePerBlobGas?: string;
+  blobVersionedHashes?: string[];
 }
 
 export interface ReceiptData {

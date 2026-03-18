@@ -107,6 +107,11 @@ describe("loadConfig", () => {
     expect(config.chainId).toBe(137);
   });
 
+  it("rejects CHAIN_ID=0", () => {
+    process.env["CHAIN_ID"] = "0";
+    expect(() => loadConfig()).toThrow("positive integer");
+  });
+
   it("defaults logLevel to info", () => {
     const config = loadConfig();
     expect(config.logLevel).toBe("info");

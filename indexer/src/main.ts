@@ -11,13 +11,14 @@ import Redis from "ioredis";
 import { loadConfig } from "./config.js";
 import { Coordinator } from "./coordinator.js";
 import { DistributedRateLimiter } from "./rate-limiter.js";
-import { RpcClient, isMethodNotSupported } from "./rpc.js";
+import { RpcClient } from "./rpc.js";
 import { RpcPool } from "./rpc-pool.js";
 import { Storage } from "./storage.js";
 import { WriteBuffer } from "./write-buffer.js";
 import { Worker } from "./worker.js";
 import { Metrics } from "./metrics.js";
 import { startMetricsServer } from "./metrics-server.js";
+import { getChainProfile, resolveEndBlock } from "./chain-profile.js";
 import { log, setLogLevel } from "./logger.js";
 
 let storage: Storage | undefined;
@@ -28,13 +29,17 @@ async function main() {
   const config = loadConfig();
   setLogLevel(config.logLevel);
 
+  const profile = getChainProfile(config.chainId);
+
   log("info", "Starting chain-ingest", {
     chainId: config.chainId,
+    chainName: profile.name,
     workerId: config.workerId,
     rpcUrl: (() => { try { return new URL(config.rpcUrls[0]!).host; } catch { return config.rpcUrls[0]; } })(),
     rpcEndpoints: config.rpcUrls.length,
     batchSize: config.batchSize,
     rateLimit: config.rateLimit,
+    finalityMode: profile.finalityMode,
     seedOnly: config.seedOnly,
   });
 
@@ -49,32 +54,16 @@ async function main() {
     ? new RpcPool(config.rpcUrls, rateLimiter, config.maxRetries)
     : new RpcClient(config.rpcUrls[0]!, rateLimiter, config.maxRetries);
 
-  let endBlock: number;
-  let finalityMode: "finalized" | "latest";
-  if (config.endBlock === "finalized") {
-    try {
-      endBlock = await rpc.getFinalizedBlockNumber();
-      finalityMode = "finalized";
-    } catch (err) {
-      if (!isMethodNotSupported(err)) {
-        // Network timeout, 500, circuit breaker, etc. — don't silently degrade.
-        // The RPC client already retried with backoff; if we're here, it's persistent.
-        throw err;
-      }
-      // JSON-RPC -32601: node doesn't support "finalized" tag — fall back to latest.
-      log("warn", "RPC does not support 'finalized' block tag (-32601), falling back to 'latest'");
-      endBlock = await rpc.getBlockNumber();
-      finalityMode = "latest";
-    }
-  } else if (config.endBlock === "latest") {
-    endBlock = await rpc.getBlockNumber();
-    finalityMode = "latest";
-  } else {
-    endBlock = config.endBlock;
-    finalityMode = "finalized"; // explicit block number — finality is irrelevant
-  }
+  // Resolve end block using chain-appropriate finality semantics.
+  // ChainProfile handles the differences: Ethereum uses "finalized" tag,
+  // Polygon uses depth-128, Arbitrum uses instant (latest), etc.
+  const { endBlock, resolvedFinality } = await resolveEndBlock(rpc, profile, config.endBlock);
 
-  log("info", "Finality mode resolved", { finalityMode, endBlock });
+  log("info", "Finality resolved", {
+    chain: profile.name,
+    finality: resolvedFinality,
+    endBlock,
+  });
 
   await storage.migrate(endBlock);
 

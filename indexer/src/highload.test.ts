@@ -97,7 +97,7 @@ describe("High-load: Coordinator", () => {
     expect(stats.completed).toBe(10000);
   });
 
-  it("reclaim handles many stale tasks", async () => {
+  it("reclaim handles many stale tasks (XAUTOCLAIM)", async () => {
     const redis = createMockRedis();
     const coordinator = new Coordinator(redis);
 
@@ -112,18 +112,16 @@ describe("High-load: Coordinator", () => {
     }
     expect(tasks.length).toBe(10);
 
-    // Simulate stale metadata and expired heartbeat
-    for (const task of tasks) {
-      const key = `${task.startBlock}:${task.endBlock}`;
-      await redis.hset(
-        "indexer:1:task_meta",
-        key,
-        JSON.stringify({ assignedTo: "dead-worker", assignedAt: Date.now() - 300_000 })
-      );
+    // Simulate stale by backdating pending entries in the stream
+    const stream = redis._store.streams.get(`indexer:{1}:tasks`);
+    const group = stream?.groups.get("workers");
+    if (group) {
+      for (const [, info] of group.pending) {
+        info.deliveredAt = Date.now() - 300_000;
+      }
     }
-    redis._store.keys.delete("indexer:1:heartbeat:dead-worker");
 
-    // Reclaim all 10
+    // Reclaim all 10 via XAUTOCLAIM
     const reclaimed = await coordinator.reclaimStaleTasks(120_000);
     expect(reclaimed).toBe(10);
 
@@ -146,7 +144,7 @@ describe("High-load: Worker", () => {
       completedBlocks,
       blockHashes,
       setTasks: (tasks: BlockTask[]) => { taskQueue = [...tasks]; },
-      updateHeartbeat: vi.fn(async () => {}),
+
       reclaimStaleTasks: vi.fn(async () => 0),
       claimTask: vi.fn(async () => taskQueue.shift() ?? null),
       completeTask: vi.fn(async (task: BlockTask) => {
@@ -170,6 +168,7 @@ describe("High-load: Worker", () => {
         pending: taskQueue.length,
         processing: 0,
         completed: completedBlocks.size,
+        dlqSize: 0,
       })),
       evictCompletedBelow: vi.fn(async () => 0),
       getLastBlockHash: vi.fn(async (blockNumber: number) => {
@@ -383,13 +382,16 @@ describe("High-load: Storage batch insert", () => {
     (storage as any).pool = mockPool;
     (storage as any).ensurePartition = vi.fn(async () => {});
 
-    // Build a block with 200 transactions
+    // Build a block with 200 transactions — use valid hex for BYTEA conversion
+    const pad32 = (i: number) => "0x" + i.toString(16).padStart(64, "0");
+    const pad20 = (i: number) => "0x" + i.toString(16).padStart(40, "0");
+
     const transactions = Array.from({ length: 200 }, (_, i) => ({
-      hash: `0xtx${i}`,
+      hash: pad32(0xaa0000 + i),
       blockNumber: "0xa",
       transactionIndex: "0x" + i.toString(16),
-      from: `0xfrom${i}`,
-      to: `0xto${i}`,
+      from: pad20(0xf00000 + i),
+      to: pad20(0xe00000 + i),
       value: "0x0",
       gasPrice: "0x1",
       gas: "0x5208",
@@ -405,8 +407,8 @@ describe("High-load: Storage batch insert", () => {
       contractAddress: null,
       logs: [
         {
-          address: "0xcontract",
-          topics: ["0xddf252ad"],
+          address: pad20(0xcc0000),
+          topics: [pad32(0xddf252ad)],
           data: "0x",
           logIndex: "0x0",
           transactionHash: tx.hash,
@@ -417,8 +419,8 @@ describe("High-load: Storage batch insert", () => {
 
     const block = {
       number: "0xa",
-      hash: "0xblock",
-      parentHash: "0xparent",
+      hash: pad32(0xb10c),
+      parentHash: pad32(0xb10b),
       timestamp: "0x60",
       gasUsed: "0xfffff",
       gasLimit: "0x1000000",
@@ -427,12 +429,12 @@ describe("High-load: Storage batch insert", () => {
 
     await storage.insertBlock(block as any, receipts as any, "stress-worker");
 
-    // Verify transaction INSERT has 200 * 10 = 2000 parameters
+    // Verify transaction INSERT has 200 * 15 = 3000 parameters (10 original + 5 EIP-1559/4844)
     const txInsert = queries.find(
       (q) => q.text?.includes("raw.transactions") && q.text?.includes("INSERT")
     );
     expect(txInsert).toBeDefined();
-    expect(txInsert!.values!.length).toBe(2000); // 200 tx * 10 columns
+    expect(txInsert!.values!.length).toBe(3000); // 200 tx * 15 columns
 
     // Verify receipt INSERT has 200 * 7 = 1400 parameters
     const rcptInsert = queries.find(
@@ -471,8 +473,8 @@ describe("High-load: Storage batch insert", () => {
 
     const block = {
       number: "0xa",
-      hash: "0xblock",
-      parentHash: "0xparent",
+      hash: "0x" + "ab".repeat(32),
+      parentHash: "0x" + "cd".repeat(32),
       timestamp: "0x60",
       gasUsed: "0x0",
       gasLimit: "0x200",

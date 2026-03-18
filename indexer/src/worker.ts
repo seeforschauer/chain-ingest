@@ -22,9 +22,9 @@ export class Worker {
   private lastBlockHash: string | null = null;
   private readonly metrics: WorkerMetrics;
   private metricsTimer: ReturnType<typeof setInterval> | null = null;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastReclaimAt = 0;
   private lastStatsAt = 0;
+  private cachedWatermark = 0;
 
   constructor(
     private readonly workerId: string,
@@ -50,17 +50,6 @@ export class Worker {
     log("info", "Worker started", { workerId: this.workerId });
 
     this.metricsTimer = setInterval(() => this.logMetrics(), 30_000);
-
-    this.heartbeatTimer = setInterval(() => {
-      this.coordinator.updateHeartbeat(this.workerId).catch((err) => {
-        log("warn", "Heartbeat update failed", {
-          workerId: this.workerId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }, 10_000);
-
-    await this.coordinator.updateHeartbeat(this.workerId);
 
     let emptyPolls = 0;
 
@@ -157,9 +146,14 @@ export class Worker {
           if (blockNum > startBlock) {
             await this.coordinator.markBlocksCompleted(startBlock, blockNum - 1);
           }
-          // Drain split is not a failure — reset retryCount so the remainder
-          // doesn't inherit accumulated retries from the original task.
-          await this.coordinator.requeueTask({ ...task, retryCount: 0 });
+          // Drain split: requeue from the split point (not original start) to
+          // preserve chain integrity. The next worker loads getLastBlockHash(blockNum-1)
+          // which was just set by this worker, enabling correct parentHash verification.
+          await this.coordinator.requeueTask({
+            ...task,
+            startBlock: blockNum,
+            retryCount: 0,
+          }, false);
 
           this.running = false;
           return;
@@ -181,19 +175,17 @@ export class Worker {
       lastFlushedBlock = endBlock;
       await this.coordinator.completeTask(task);
 
-      // Compute contiguous watermark — scan from current PG watermark upward,
-      // stop at the first gap. This prevents the watermark from jumping past
-      // unprocessed blocks when tasks complete out of order.
-      const currentWatermark = await this.storage.getWatermark(this.chainId);
-      const contiguousWatermark = await this.coordinator.getContiguousWatermark(currentWatermark);
-      if (contiguousWatermark >= currentWatermark) {
+      // Contiguous watermark — use cached value to avoid per-task PG read.
+      // At 50 workers × 120 chains, uncached getWatermark generates 6K queries/sec
+      // against the same small table. Cache refreshes when the watermark advances.
+      const contiguousWatermark = await this.coordinator.getContiguousWatermark(this.cachedWatermark);
+      if (contiguousWatermark >= this.cachedWatermark) {
         await this.storage.updateWatermark(this.chainId, contiguousWatermark, this.workerId);
+        this.cachedWatermark = contiguousWatermark;
       }
 
-      // Evict completed entries below watermark to bound Redis memory growth.
-      // Use the known value — no need to re-read from PG.
-      const safeEvictPoint = contiguousWatermark >= currentWatermark ? contiguousWatermark : currentWatermark;
-      await this.coordinator.evictCompletedBelow(safeEvictPoint);
+      // Evict block hashes below watermark (bitmap is fixed-size, no eviction needed).
+      await this.coordinator.evictCompletedBelow(this.cachedWatermark);
 
       // Throttle stats — getStats() is 3 Redis calls per invocation
       const now = Date.now();
@@ -203,6 +195,7 @@ export class Worker {
           this.promMetrics.queuePending.set(stats.pending);
           this.promMetrics.queueProcessing.set(stats.processing);
           this.promMetrics.queueCompleted.set(stats.completed);
+          this.promMetrics.dlqSize.set(stats.dlqSize);
           if (this.rateLimiter?.effectiveRate !== undefined) {
             this.promMetrics.rateLimiterEffectiveRate.set(this.rateLimiter.effectiveRate);
           }
@@ -310,10 +303,6 @@ export class Worker {
     if (this.metricsTimer) {
       clearInterval(this.metricsTimer);
       this.metricsTimer = null;
-    }
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
     }
     this.running = false;
   }

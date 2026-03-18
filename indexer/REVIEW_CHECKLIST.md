@@ -4,10 +4,10 @@ Applicable to any distributed data pipeline. 32 design decisions documented in A
 
 ## 1. Operation Ordering in Distributed State
 
-- [ ] **Write before delete**: When moving state between stores (e.g., queue A to queue B), always write to the destination FIRST, then remove from the source. If you crash between steps, the item appears in both (safe, deduplicated via idempotent writes) instead of neither (data loss).
-  - Bad: `lrem(processing)` then `lpush(pending)` — crash between = task vanishes
-  - Good: `lpush(pending)` then `lrem(processing)` — crash between = task in both queues, `isBlockCompleted` skips duplicates
-  - Use `lpush` (not `rpush`) for requeue — places failed tasks at the back of the claim order, preventing poison blocks from starving healthy work
+- [ ] **Write before delete**: When moving state between stores, always write to the destination FIRST, then remove from the source. If you crash between steps, the item appears in both (safe, deduplicated via idempotent writes) instead of neither (data loss).
+  - Bad: `XACK` then `XADD` — crash between = task vanishes
+  - Good: `XADD` (new entry) then `XACK + XDEL` (original) — crash between = duplicate entry, `isBlockCompleted` skips
+  - With Streams: SETBIT bitmap → XACK + XDEL (pipeline) for completion
 - [ ] **Apply the pattern uniformly**: If you fix this in `completeTask`, audit `requeueTask`, `reclaimStaleTasks`, and every other method that moves state between stores. Same bug class, same fix.
 
 ## 2. Resource Isolation (Multi-Tenant Keys)
@@ -84,7 +84,7 @@ Applicable to any distributed data pipeline. 32 design decisions documented in A
 ## 14. Connection Lifecycle
 
 - [ ] **Graceful disconnect — send QUIT before TCP close**: `redis.quit()` sends QUIT and waits for acknowledgment. `redis.disconnect()` drops TCP without handshake. At 120 chains x N workers, ungraceful disconnects leak server-side connection state and can exhaust Redis's connection tracking.
-- [ ] **Pipeline independent Redis calls at every callsite**: If two Redis commands are independent of each other (e.g., `lrem` + `hdel` cleanup, or `hset` + `set` post-claim setup), pipeline them into a single round-trip. Audit every method for sequential `await redis.x(); await redis.y()` where neither depends on the other's result.
+- [ ] **Pipeline independent Redis calls at every callsite**: If two Redis commands are independent of each other (e.g., `XACK` + `XDEL` cleanup), pipeline them into a single round-trip. Audit every method for sequential `await redis.x(); await redis.y()` where neither depends on the other's result.
 
 ## 15. Test Coverage Patterns
 
@@ -95,7 +95,7 @@ Applicable to any distributed data pipeline. 32 design decisions documented in A
 ## 16. Systematic Bug-Class Auditing
 
 - [ ] **After fixing any bug, grep for the same pattern across the entire codebase**: The write-before-delete bug can appear in multiple callsites. Fixing it in one place while missing three others is worse than not fixing it at all — it shows you understood the problem but didn't apply it systematically.
-  - Method: `grep lrem` (or whatever the operation is) -> audit every callsite
+  - Method: `grep xack` / `grep xdel` (or whatever the operation is) -> audit every callsite
 - [ ] **Same principle for scoping/isolation**: After scoping one Redis key by chainId, grep for all remaining bare key literals.
 - [ ] **Same principle for strict parsing**: After fixing `parseInt` -> `Number()` in one parser, audit every other `parseInt` in config.
 

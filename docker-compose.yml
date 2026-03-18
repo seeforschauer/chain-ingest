@@ -1,3 +1,7 @@
+# Production-ready infrastructure for chain-ingest.
+# PgBouncer in transaction mode: bounds PG connections at multi-chain scale.
+# Without it: pgPoolMax(20) × 120 chains × N workers = OOM on PG's max_connections.
+
 volumes:
   redis-data:
   postgres-data:
@@ -10,7 +14,12 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
+    command: >
+      redis-server
+        --appendonly yes
+        --maxmemory 512mb
+        --maxmemory-policy noeviction
+        --save 60 1000
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -34,3 +43,74 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    command: >
+      postgres
+        -c max_connections=500
+        -c shared_buffers=256MB
+        -c work_mem=16MB
+        -c maintenance_work_mem=128MB
+        -c effective_cache_size=768MB
+
+  # PgBouncer — connection pooler in transaction mode.
+  # At 120 chains × pgPoolMax(20) × N workers, direct PG connections exceed
+  # max_connections (default 100, practical limit ~500). PgBouncer multiplexes:
+  # 2400 app connections → 100 PG connections.
+  pgbouncer:
+    image: edoburu/pgbouncer:1.22.0
+    container_name: indexer-pgbouncer
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-indexer}:${POSTGRES_PASSWORD:-indexer_password}@postgres:5432/${POSTGRES_DB:-indexer}"
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 2400
+      DEFAULT_POOL_SIZE: 100
+      MIN_POOL_SIZE: 10
+      RESERVE_POOL_SIZE: 20
+      RESERVE_POOL_TIMEOUT: 3
+      SERVER_LIFETIME: 3600
+      SERVER_IDLE_TIMEOUT: 600
+      LOG_CONNECTIONS: 0
+      LOG_DISCONNECTIONS: 0
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # pg_isready only checks TCP — verify PgBouncer can actually proxy to PG
+      test: ["CMD-SHELL", "psql -h localhost -p 5432 -U ${POSTGRES_USER:-indexer} -d ${POSTGRES_DB:-indexer} -c 'SELECT 1' -q -t"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Indexer worker. Connect via PgBouncer (port 6432), not directly to PG.
+  # Scale with: docker compose up --scale indexer=5
+  # Multi-chain: override CHAIN_ID per instance.
+  indexer:
+    build:
+      context: ./indexer
+      dockerfile: Dockerfile
+    environment:
+      CHAIN_ID: ${CHAIN_ID:-1}
+      POSTGRES_URL: "postgresql://${POSTGRES_USER:-indexer}:${POSTGRES_PASSWORD:-indexer_password}@pgbouncer:5432/${POSTGRES_DB:-indexer}"
+      REDIS_URL: "redis://redis:6379"
+      RPC_URL: ${RPC_URL:-http://host.docker.internal:8545}
+      RPC_URLS: ${RPC_URLS:-}
+      BATCH_SIZE: ${BATCH_SIZE:-10}
+      FLUSH_SIZE: ${FLUSH_SIZE:-10}
+      FLUSH_INTERVAL_MS: ${FLUSH_INTERVAL_MS:-5000}
+      RATE_LIMIT: ${RATE_LIMIT:-50}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      METRICS_PORT: "9090"
+      PG_POOL_MAX: "5"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

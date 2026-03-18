@@ -5,18 +5,18 @@
 ```bash
 cd indexer
 npm install
-npm test              # 121 tests, ~3s
+npm test              # 137 tests, ~3s
 npm run typecheck     # TypeScript strict check
 ```
 
-## 2. Integration test with Docker (Redis + PostgreSQL + Anvil)
+## 2. Integration test with Docker (Redis + PostgreSQL + PgBouncer + Anvil)
 
 **What it tests:** Full pipeline end-to-end — RPC fetch, PG insert, Redis coordination, schema migration.
 **Critical:** Proves the system actually indexes real blocks, not just passes mocked tests.
 
 ```bash
 # Start infrastructure from repo root
-docker compose up -d              # Redis + PostgreSQL
+docker compose up -d              # Redis + PostgreSQL + PgBouncer
 cd anvil && docker compose up -d  # Local Anvil RPC node
 cd ..
 
@@ -37,7 +37,7 @@ docker exec -it $(docker ps -q -f name=postgres) psql -U indexer -c \
 ## 3. Multi-worker test
 
 **What it tests:** Work distribution — two workers claim different tasks, no block duplication.
-**Critical:** Proves BLMOVE atomic claiming prevents duplicate work. Validates the coordination layer works under concurrency.
+**Critical:** Proves XREADGROUP consumer groups prevent duplicate work. Validates the coordination layer works under concurrency.
 
 ```bash
 # Terminal 1 — seed + worker 1
@@ -93,8 +93,8 @@ curl http://localhost:9191/metrics
 
 ## 7. Crash recovery
 
-**What it tests:** Worker crash mid-task — stale task reclamation picks up the unfinished work.
-**Critical:** Proves the system recovers from hard kills without data loss or duplication. Validates heartbeat expiry + stale reclaim + ON CONFLICT DO NOTHING idempotency.
+**What it tests:** Worker crash mid-task — XAUTOCLAIM reclaims the idle entry.
+**Critical:** Proves the system recovers from hard kills without data loss or duplication. Validates Stream idle-time detection + XAUTOCLAIM + ON CONFLICT DO NOTHING idempotency.
 
 ```bash
 # Start worker, let it process a few blocks, then kill -9
@@ -124,7 +124,7 @@ kill $!    # sends SIGTERM
 # Logs show "Drain requested" then "Worker stopped"
 ```
 
-**Expected:** Logs show: "Drain requested — finishing current block" → "Flushed" → "Worker stopped". No error. Next worker picks up remaining blocks.
+**Expected:** Logs show: "Drain requested — finishing current block" -> "Flushed" -> "Worker stopped". No error. Next worker picks up remaining blocks.
 
 ## 9. Seed-only mode
 
@@ -133,12 +133,12 @@ kill $!    # sends SIGTERM
 
 ```bash
 SEED_ONLY=true npm start
-# Seeds the Redis queue and exits immediately
+# Seeds the Redis stream and exits immediately
 # Then start workers separately:
 npm start
 ```
 
-**Expected:** Seed logs "Queue seeded" and exits with code 0. Worker picks up tasks from the pre-populated queue.
+**Expected:** Seed logs "Queue seeded" and exits with code 0. Worker picks up entries from the pre-populated stream.
 
 ## 10. Verbose logging
 
@@ -171,10 +171,10 @@ docker exec -it $(docker ps -q -f name=redis) redis-cli FLUSHALL
 docker exec indexer-postgres psql -U indexer -c \
   "SELECT count(*) as blocks FROM raw.blocks; SELECT count(*) as txs FROM raw.transactions;"
 
-# Redis queue stats
-docker exec indexer-redis redis-cli LLEN indexer:1:queue:pending
-docker exec indexer-redis redis-cli LLEN indexer:1:queue:processing
-docker exec indexer-redis redis-cli ZCARD indexer:1:completed_blocks
+# Redis stream stats (task queue)
+docker exec indexer-redis redis-cli XLEN "indexer:{1}:tasks"
+docker exec indexer-redis redis-cli XPENDING "indexer:{1}:tasks" workers
+docker exec indexer-redis redis-cli BITCOUNT "indexer:{1}:completed"
 
 # Check for duplicates (should return 0 rows)
 docker exec indexer-postgres psql -U indexer -c \

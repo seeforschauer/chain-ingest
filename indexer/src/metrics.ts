@@ -27,6 +27,7 @@ export class Metrics {
   readonly queueProcessing: Gauge;
   readonly queueCompleted: Gauge;
   readonly rateLimiterEffectiveRate: Gauge;
+  readonly dlqSize: Gauge;
 
   readonly rpcDurationSeconds: Histogram;
   readonly storageFlushDurationSeconds: Histogram;
@@ -95,6 +96,10 @@ export class Metrics {
     this.rateLimiterEffectiveRate = gauge({
       name: `${PREFIX}rate_limiter_effective_rate`,
       help: "Effective rate limiter rate",
+    });
+    this.dlqSize = gauge({
+      name: `${PREFIX}dlq_size`,
+      help: "Dead-letter queue size (tasks that exceeded max retries)",
     });
 
     this.rpcDurationSeconds = histogram({

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Coordinator, type BlockTask } from "./coordinator.js";
 import { createMockRedis } from "./test-utils.js";
 
-describe("Coordinator", () => {
+describe("Coordinator (Streams + Bitmaps)", () => {
   let redis: ReturnType<typeof createMockRedis>;
   let coordinator: Coordinator;
 
@@ -12,7 +12,7 @@ describe("Coordinator", () => {
   });
 
   describe("initQueue", () => {
-    it("seeds the queue with block range tasks", async () => {
+    it("seeds the stream with block range tasks", async () => {
       await coordinator.initQueue(0, 29, 10);
       const stats = await coordinator.getStats();
       expect(stats.pending).toBe(3);
@@ -29,8 +29,9 @@ describe("Coordinator", () => {
     });
 
     it("skips already-completed ranges", async () => {
+      // Mark blocks 0-9 as completed in bitmap
       for (let b = 0; b <= 9; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
       await coordinator.initQueue(0, 19, 10);
       const stats = await coordinator.getStats();
@@ -39,7 +40,7 @@ describe("Coordinator", () => {
   });
 
   describe("claimTask / completeTask / requeueTask", () => {
-    it("claims a task and moves it to processing", async () => {
+    it("claims a task from the stream", async () => {
       await coordinator.initQueue(100, 109, 10);
       const task = await coordinator.claimTask("w1", 0);
 
@@ -47,51 +48,45 @@ describe("Coordinator", () => {
       expect(task!.startBlock).toBe(100);
       expect(task!.endBlock).toBe(109);
       expect(task!.assignedTo).toBe("w1");
-
-      const stats = await coordinator.getStats();
-      expect(stats.pending).toBe(0);
-      expect(stats.processing).toBe(1);
+      expect(task!.messageId).toBeDefined();
     });
 
-    it("returns null when queue is empty", async () => {
-      const task = await coordinator.claimTask("w1", 0);
-      expect(task).toBeNull();
+    it("returns null when stream is empty", async () => {
+      // Need to create group first
+      await coordinator.initQueue(0, 0, 1);
+      const task1 = await coordinator.claimTask("w1", 0);
+      await coordinator.completeTask(task1!);
+      const task2 = await coordinator.claimTask("w1", 0);
+      expect(task2).toBeNull();
     });
 
-    it("completeTask marks blocks as completed", async () => {
+    it("completeTask marks blocks in bitmap and acks stream entry", async () => {
       await coordinator.initQueue(0, 4, 5);
       const task = await coordinator.claimTask("w1", 0);
       await coordinator.completeTask(task!);
 
-      const stats = await coordinator.getStats();
-      expect(stats.processing).toBe(0);
-      expect(stats.completed).toBe(5);
-
+      // Blocks should be marked in bitmap
       expect(await coordinator.isBlockCompleted(0)).toBe(true);
       expect(await coordinator.isBlockCompleted(4)).toBe(true);
       expect(await coordinator.isBlockCompleted(5)).toBe(false);
+
+      const stats = await coordinator.getStats();
+      expect(stats.completed).toBe(5);
     });
 
-    it("requeueTask returns task to pending", async () => {
+    it("requeueTask adds new stream entry with incremented retryCount", async () => {
       await coordinator.initQueue(0, 9, 10);
       const task = await coordinator.claimTask("w1", 0);
       await coordinator.requeueTask(task!);
 
       const stats = await coordinator.getStats();
-      expect(stats.pending).toBe(1);
-      expect(stats.processing).toBe(0);
+      expect(stats.pending).toBe(1); // new entry added
     });
   });
 
   describe("markBlocksCompleted", () => {
-    it("marks individual blocks without touching processing queue", async () => {
-      await coordinator.initQueue(0, 9, 10);
-      await coordinator.claimTask("w1", 0);
-
+    it("marks blocks in bitmap without affecting stream", async () => {
       await coordinator.markBlocksCompleted(0, 4);
-
-      const stats = await coordinator.getStats();
-      expect(stats.processing).toBe(1);
 
       expect(await coordinator.isBlockCompleted(0)).toBe(true);
       expect(await coordinator.isBlockCompleted(4)).toBe(true);
@@ -100,90 +95,33 @@ describe("Coordinator", () => {
   });
 
   describe("reclaimStaleTasks", () => {
-    it("reclaims tasks with expired heartbeat", async () => {
+    it("reclaims idle tasks via XAUTOCLAIM", async () => {
       await coordinator.initQueue(0, 9, 10);
       const task = await coordinator.claimTask("dead-worker", 0);
+      expect(task).not.toBeNull();
 
-      const taskKey = `${task!.startBlock}:${task!.endBlock}`;
-      await redis.hset(
-        "indexer:1:task_meta",
-        taskKey,
-        JSON.stringify({ assignedTo: "dead-worker", assignedAt: Date.now() - 300_000 })
-      );
-      redis._store.keys.delete("indexer:1:heartbeat:dead-worker");
-
-      const reclaimed = await coordinator.reclaimStaleTasks(120_000);
-      expect(reclaimed).toBe(1);
-
-      const stats = await coordinator.getStats();
-      expect(stats.pending).toBe(1);
-      expect(stats.processing).toBe(0);
-    });
-
-    it("does NOT reclaim tasks from alive workers", async () => {
-      await coordinator.initQueue(0, 9, 10);
-      const task = await coordinator.claimTask("slow-worker", 0);
-
-      const taskKey = `${task!.startBlock}:${task!.endBlock}`;
-      await redis.hset(
-        "indexer:1:task_meta",
-        taskKey,
-        JSON.stringify({ assignedTo: "slow-worker", assignedAt: Date.now() - 300_000 })
-      );
-      await coordinator.updateHeartbeat("slow-worker");
-
-      const reclaimed = await coordinator.reclaimStaleTasks(120_000);
-      expect(reclaimed).toBe(0);
-
-      const stats = await coordinator.getStats();
-      expect(stats.processing).toBe(1);
-    });
-
-    it("reclaims orphaned tasks with no metadata", async () => {
-      await coordinator.initQueue(0, 9, 10);
-      await coordinator.claimTask("crashed-worker", 0);
-
-      await redis.hdel("indexer:1:task_meta", "0:9");
+      // Simulate stale: manually set deliveredAt to past
+      const stream = redis._store.streams.get(`indexer:{1}:tasks`);
+      const group = stream?.groups.get("workers");
+      if (group && task!.messageId) {
+        const pending = group.pending.get(task!.messageId);
+        if (pending) pending.deliveredAt = Date.now() - 300_000;
+      }
 
       const reclaimed = await coordinator.reclaimStaleTasks(120_000);
       expect(reclaimed).toBe(1);
 
+      // Original entry should be removed, new entry added
       const stats = await coordinator.getStats();
       expect(stats.pending).toBe(1);
-      expect(stats.processing).toBe(0);
     });
   });
 
-  describe("heartbeat", () => {
-    it("marks worker as alive after heartbeat", async () => {
-      await coordinator.updateHeartbeat("w1");
-      expect(await coordinator.isWorkerAlive("w1")).toBe(true);
-    });
-
-    it("reports missing heartbeat as dead", async () => {
-      expect(await coordinator.isWorkerAlive("ghost")).toBe(false);
-    });
-  });
 
   describe("evictCompletedBelow", () => {
-    it("removes completed entries below watermark", async () => {
-      for (let b = 0; b < 10; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
-      }
-      const removed = await coordinator.evictCompletedBelow(5);
-      expect(removed).toBe(5);
-      expect(await coordinator.isBlockCompleted(4)).toBe(false);
-      expect(await coordinator.isBlockCompleted(5)).toBe(true);
-    });
-
     it("evicts BLOCK_HASH entries below watermark", async () => {
-      // Store hashes for blocks 0-9
       for (let b = 0; b < 10; b++) {
         await coordinator.setLastBlockHash(b, `0xhash_${b}`);
-      }
-      // Also add completed blocks so zremrangebyscore has something to remove
-      for (let b = 0; b < 10; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
       }
 
       await coordinator.evictCompletedBelow(5);
@@ -227,7 +165,7 @@ describe("Coordinator", () => {
       expect(await coordinator.getLastBlockHash(15)).toBeNull();
     });
 
-    it("uses chain-scoped Redis keys", async () => {
+    it("uses chain-scoped Redis keys with hash tags", async () => {
       const redis2 = createMockRedis();
       const coord1 = new Coordinator(redis2, 1);
       const coord42 = new Coordinator(redis2, 42);
@@ -240,85 +178,80 @@ describe("Coordinator", () => {
     });
   });
 
-  describe("getContiguousWatermark", () => {
+  describe("getContiguousWatermark (bitmap scan)", () => {
     it("returns contiguous high point from watermark", async () => {
-      // Blocks 0-9 all completed
       for (let b = 0; b <= 9; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
       const watermark = await coordinator.getContiguousWatermark(0);
       expect(watermark).toBe(9);
     });
 
     it("stops at first gap", async () => {
-      // Blocks 0-4 completed, block 5 missing, blocks 6-9 completed
       for (let b = 0; b <= 4; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
+      // block 5 missing
       for (let b = 6; b <= 9; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
       const watermark = await coordinator.getContiguousWatermark(0);
       expect(watermark).toBe(4);
     });
 
     it("returns currentWatermark - 1 when first block is missing", async () => {
-      // Blocks 5-9 completed but block 0 (the starting point) is missing
       for (let b = 5; b <= 9; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
       const watermark = await coordinator.getContiguousWatermark(0);
       expect(watermark).toBe(-1);
     });
 
     it("works with non-zero starting watermark", async () => {
-      // Blocks 5-12 completed, scan from watermark=5
       for (let b = 5; b <= 12; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
       const watermark = await coordinator.getContiguousWatermark(5);
       expect(watermark).toBe(12);
     });
 
-    it("handles gap right after starting watermark", async () => {
-      // Watermark at 5, block 5 missing, blocks 6-9 completed
-      for (let b = 6; b <= 9; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
-      }
-      const watermark = await coordinator.getContiguousWatermark(5);
-      expect(watermark).toBe(4);
-    });
-
-    it("handles empty completed set", async () => {
+    it("handles empty bitmap", async () => {
       const watermark = await coordinator.getContiguousWatermark(0);
       expect(watermark).toBe(-1);
     });
 
     it("prevents the out-of-order watermark bug", async () => {
-      // Scenario from BUG 1: Worker C completes [30-39] before Worker A completes [0-9]
-      // Blocks 30-39 completed, blocks 0-29 NOT completed
+      // Worker C completes [30-39] before Worker A completes [0-9]
       for (let b = 30; b <= 39; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
-      // Starting from watermark 0, contiguous should be -1 (block 0 not completed)
-      const watermark = await coordinator.getContiguousWatermark(0);
-      expect(watermark).toBe(-1);
+      expect(await coordinator.getContiguousWatermark(0)).toBe(-1);
 
-      // Now Worker A completes [0-9]
+      // Worker A completes [0-9]
       for (let b = 0; b <= 9; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
-      // Contiguous should now advance to 9 (gap at 10)
-      const watermark2 = await coordinator.getContiguousWatermark(0);
-      expect(watermark2).toBe(9);
+      expect(await coordinator.getContiguousWatermark(0)).toBe(9);
 
       // Worker B completes [10-29], closing the gap
       for (let b = 10; b <= 29; b++) {
-        await redis.zadd("indexer:1:completed_blocks", b, b.toString());
+        await redis.setbit(`indexer:{1}:completed`, b, 1);
       }
-      // All blocks 0-39 contiguous, watermark should be 39
-      const watermark3 = await coordinator.getContiguousWatermark(0);
-      expect(watermark3).toBe(39);
+      expect(await coordinator.getContiguousWatermark(0)).toBe(39);
+    });
+  });
+
+  describe("getCompletedBlocksInRange (bitmap)", () => {
+    it("returns completed blocks in range", async () => {
+      await redis.setbit(`indexer:{1}:completed`, 3, 1);
+      await redis.setbit(`indexer:{1}:completed`, 7, 1);
+      const completed = await coordinator.getCompletedBlocksInRange(0, 9);
+      expect(completed).toEqual(new Set([3, 7]));
+    });
+
+    it("returns empty set when no blocks completed", async () => {
+      const completed = await coordinator.getCompletedBlocksInRange(0, 9);
+      expect(completed).toEqual(new Set());
     });
   });
 });

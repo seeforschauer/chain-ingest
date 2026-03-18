@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { Worker } from "./worker.js";
 import type { Coordinator, BlockTask } from "./coordinator.js";
 import type { RpcEndpoint } from "./rpc.js";
@@ -17,7 +17,7 @@ function createMockCoordinator() {
     requeuedTasks,
     blockHashes,
     setTasks: (tasks: BlockTask[]) => { taskQueue = [...tasks]; },
-    updateHeartbeat: vi.fn(async () => {}),
+
     reclaimStaleTasks: vi.fn(async () => 0),
     claimTask: vi.fn(async () => taskQueue.shift() ?? null),
     completeTask: vi.fn(async (task: BlockTask) => {
@@ -44,6 +44,7 @@ function createMockCoordinator() {
       pending: taskQueue.length,
       processing: 0,
       completed: completedBlocks.size,
+      dlqSize: 0,
     })),
     evictCompletedBelow: vi.fn(async () => 0),
     getLastBlockHash: vi.fn(async (blockNumber: number) => {
@@ -218,8 +219,11 @@ describe("Worker", () => {
 
     // Worker should have indexed 1 block, then drained
     expect(blockCount).toBe(1);
-    // Should have requeued the original task
-    expect(coord.requeueTask).toHaveBeenCalled();
+    // Should have requeued from the split point (block 1), not the original start (block 0)
+    const requeueCall = (coord.requeueTask as any).mock.calls[0];
+    expect(requeueCall[0].startBlock).toBe(1);
+    expect(requeueCall[0].endBlock).toBe(9);
+    expect(requeueCall[0].retryCount).toBe(0);
     // Should have marked block 0 as completed
     expect(coord.markBlocksCompleted).toHaveBeenCalledWith(0, 0);
   });
